@@ -1,0 +1,62 @@
+[project]
+name = "evo2-nim-mcp"
+version = "0.1.0"
+description = "LLM-optimized MCP server for the NVIDIA NIM Evo2 container (DNA scoring, embeddings, generation, splice + variant analysis)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Gael Debost", email = "gael@ideagency.fr"}
+]
+keywords = ["mcp", "evo2", "nvidia", "nim", "dna", "genomics", "variant-effect", "biology", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "fastmcp>=0.1.0",
+    "httpx>=0.25.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "respx>=0.20.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/zzgael/evo2-nim-mcp"
+"Bug Reports" = "https://github.com/zzgael/evo2-nim-mcp/issues"
+"Source" = "https://github.com/zzgael/evo2-nim-mcp"
+
+[project.scripts]
+evo2-nim-mcp = "evo2_nim_mcp.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["evo2_nim_mcp*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+ignore = ["E501"]
