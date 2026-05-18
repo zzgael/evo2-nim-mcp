@@ -437,6 +437,111 @@ async def embed_sequence(sequence: str, layer_name: str | None = None) -> str:
 
 
 # ----------------------------------------------------------------------
+# Tool 5b — embed_similarity (cosine between two sequences)
+# ----------------------------------------------------------------------
+
+
+@mcp.tool()
+async def embed_similarity(
+    sequence_a: str,
+    sequence_b: str,
+    layer_name: str | None = None,
+) -> str:
+    """Compute cosine similarity between embeddings of two DNA sequences.
+
+    USE THIS WHEN:
+    - User wants to compare two variants (e.g. wild-type vs mutant flanking
+      window) and quantify how much one diverges from the other in
+      embedding space
+    - User has a cohort of variants and asks "which one is most different
+      from WT" — call this pairwise vs the reference
+    - You're clustering or ranking sequences by similarity
+
+    DO NOT USE WHEN:
+    - User wants raw embeddings → use `embed_sequence`
+    - User wants pathogenicity score of a variant → use `score_variant_at`
+      or `score_snp` instead — embedding distance ≠ likelihood delta
+    - Sequences are different lengths and you need position-wise comparison
+      (this tool mean-pools positions, so length-mismatch is tolerated but
+      may not reflect what you want)
+
+    PARAMETERS:
+    - `sequence_a`, `sequence_b`: DNA, IUPAC alphabet, length ≥ 1.
+    - `layer_name`: which hidden layer to embed at. Default depends on
+      checkpoint (`decoder.layers.20.mlp` for 40B). Both sequences are
+      embedded at the same layer.
+
+    INTERPRETATION:
+    - `cosine_similarity_mean_pool`: mean-pool each embedding over the
+      sequence dimension, then cosine of the two pooled vectors.
+      1.0 = identical, 0 = orthogonal, -1 = anti-parallel. Natural genomic
+      sequences typically cluster well above 0.9 with each other; values
+      far below that suggest large functional or compositional differences.
+    - `cosine_similarity_centered`: if both sequences have the same length,
+      also reports the average cosine across position-wise pairs (more
+      sensitive to local differences than mean-pool).
+    - These are similarity signals, not classifiers. Combine with
+      `score_variant_at`, VEP, and structural information for clinical use.
+
+    Returns markdown with the two metrics, the layer used, and runtime.
+    """
+    t0 = time.monotonic()
+    checkpoint = _checkpoint_name()
+    layer = layer_name or layer_catalog.default_embedding_layer(checkpoint)
+
+    async def _embed(seq: str) -> tuple[np.ndarray, float]:
+        client = _get_client()
+        resp = await client.forward({"sequence": seq, "output_layers": [layer]})
+        arrays = decode_forward_response(resp.get("data", ""))
+        key = layer_catalog.response_key(layer)
+        if key not in arrays:
+            raise NimError(
+                f"NIM /forward did not return key {key!r}. "
+                f"Available: {list(arrays)}."
+            )
+        emb = arrays[key]
+        if emb.ndim == 3 and emb.shape[1] == 1:
+            emb = emb.squeeze(axis=1)
+        return emb.astype(np.float64), float(resp.get("elapsed_ms", 0.0))
+
+    try:
+        emb_a, ms_a = await _embed(sequence_a)
+        emb_b, ms_b = await _embed(sequence_b)
+    except (NimError, NimNotReadyError, NpzDecodeError) as exc:
+        return f"# Error\n\n{exc}"
+
+    def _cos(u: np.ndarray, v: np.ndarray) -> float:
+        nu = float(np.linalg.norm(u))
+        nv = float(np.linalg.norm(v))
+        if nu == 0 or nv == 0:
+            return 0.0
+        return float(np.dot(u, v) / (nu * nv))
+
+    pooled_a = emb_a.mean(axis=0)
+    pooled_b = emb_b.mean(axis=0)
+    cos_pool = _cos(pooled_a, pooled_b)
+
+    cos_pos: float | None = None
+    if emb_a.shape[0] == emb_b.shape[0]:
+        # Position-wise cosine averaged across positions
+        per_pos = np.array(
+            [_cos(emb_a[i], emb_b[i]) for i in range(emb_a.shape[0])],
+            dtype=np.float64,
+        )
+        cos_pos = float(per_pos.mean())
+
+    return formatters.format_embed_similarity(
+        sequence_a_len=len(sequence_a),
+        sequence_b_len=len(sequence_b),
+        layer_name=layer,
+        cosine_pool=cos_pool,
+        cosine_position_mean=cos_pos,
+        server_ms=ms_a + ms_b,
+        total_ms=(time.monotonic() - t0) * 1000.0,
+    )
+
+
+# ----------------------------------------------------------------------
 # Tool 6 — generate_sequence
 # ----------------------------------------------------------------------
 

@@ -364,6 +364,44 @@ interpretation.
 """
 
 
+def format_embed_similarity(
+    *,
+    sequence_a_len: int,
+    sequence_b_len: int,
+    layer_name: str,
+    cosine_pool: float,
+    cosine_position_mean: float | None,
+    server_ms: float | None,
+    total_ms: float | None,
+) -> str:
+    """Markdown summary of `embed_similarity`."""
+    pos_line = (
+        f"- **cosine_similarity_centered** (position-wise mean): {cosine_position_mean:+.4f}"
+        if cosine_position_mean is not None
+        else "- **cosine_similarity_centered**: not reported (sequences differ in length)"
+    )
+    return f"""# Embedding similarity
+
+## Result
+- **layer**: `{layer_name}`
+- **sequence A length**: {sequence_a_len} nt
+- **sequence B length**: {sequence_b_len} nt
+- **cosine_similarity_mean_pool**: {cosine_pool:+.4f}  (mean-pool each embedding, then cosine of the two pooled vectors)
+{pos_line}
+
+## Interpretation
+- 1.0 = identical embeddings; 0 = orthogonal; -1 = anti-parallel.
+- Natural genomic sequences typically score above 0.9 with each other under
+  mean-pool. A value notably below that signals large compositional or
+  functional differences.
+- This is a similarity signal, not a classifier — combine with
+  `score_variant_at`, VEP consequence, and structural prediction for any
+  clinical interpretation.
+
+{_runtime_section(server_ms, total_ms)}
+"""
+
+
 def format_nim_health(
     *,
     status: str,
