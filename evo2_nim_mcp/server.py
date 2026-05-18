@@ -21,6 +21,7 @@ from fastmcp import FastMCP
 
 from evo2_nim_mcp import formatters, layer_catalog
 from evo2_nim_mcp.client import NimClient, NimError, NimNotReadyError
+from evo2_nim_mcp.ensembl import EnsemblClient, EnsemblError, FetchedContext
 from evo2_nim_mcp.npz import NpzDecodeError, decode_forward_response
 from evo2_nim_mcp.scoring import (
     ScoringError,
@@ -30,8 +31,9 @@ from evo2_nim_mcp.scoring import (
 
 mcp = FastMCP("Evo2 NIM")
 
-# Single shared NimClient, lazily constructed on first call.
+# Single shared clients, lazily constructed on first call.
 _client: NimClient | None = None
+_ensembl: EnsemblClient | None = None
 
 
 def _get_client() -> NimClient:
@@ -39,6 +41,13 @@ def _get_client() -> NimClient:
     if _client is None:
         _client = NimClient.from_env()
     return _client
+
+
+def _get_ensembl() -> EnsemblClient:
+    global _ensembl
+    if _ensembl is None:
+        _ensembl = EnsemblClient.from_env()
+    return _ensembl
 
 
 def _checkpoint_name() -> str:
@@ -586,3 +595,189 @@ async def nim_health() -> str:
         return formatters.format_nim_health(
             status=f"unreachable ({exc})", base_url=client.base_url
         )
+
+
+# ----------------------------------------------------------------------
+# Tool 10 — fetch_variant_context
+# ----------------------------------------------------------------------
+
+
+@mcp.tool()
+async def fetch_variant_context(
+    chromosome: str,
+    position: int,
+    window_size: int = 8192,
+    species: str = "human",
+    assembly: str = "GRCh38",
+) -> str:
+    """Fetch reference DNA centred on a genomic coordinate from Ensembl REST.
+
+    USE THIS WHEN:
+    - You have a variant by coordinate (chr, pos) and need the flanking DNA
+      before calling `score_snp` or `score_sequence`
+    - User wants to inspect the wild-type sequence around a variant
+    - You're preparing input for `embed_sequence` or `generate_sequence` and
+      need a real genomic context rather than a synthetic prompt
+
+    DO NOT USE WHEN:
+    - You already have the flanking DNA as a string → call `score_snp` directly
+    - You have only an HGVS annotation without coordinates → use `vep_mcp` first
+      to resolve the coordinate, then call this tool
+    - You need the variant pathogenicity in one shot → call `score_variant_at`
+      instead (this tool + score_snp combined)
+
+    PARAMETERS:
+    - `chromosome`: chromosome name without prefix (e.g. "16", "X"). `chr` prefix is stripped automatically.
+    - `position`: 1-based genomic coordinate of the variant.
+    - `window_size`: total length of the flanking window in bp (default 8192,
+      matching the Arc Institute BRCA1 zero-shot methodology). Max 10000 unless
+      the NIM container has been started with a higher
+      `NIM_EVO2_FORWARD_SEQUENCE_LENGTH_LIMIT`.
+    - `species`: Ensembl species slug (default "human").
+    - `assembly`: "GRCh38" (default) or "GRCh37".
+
+    INTERPRETATION:
+    - Returns markdown with the fetched sequence (truncated preview), the
+      0-based `center_index` (where `position` maps inside the window), and
+      the actual coordinates used. The base at `center_index` is the reference
+      allele at `position` on that assembly.
+
+    Returns markdown summary.
+    """
+    t0 = time.monotonic()
+    try:
+        ctx = await _get_ensembl().fetch_variant_context(
+            chromosome,
+            position,
+            window_size=window_size,
+            species=species,
+            assembly=assembly,
+        )
+    except (EnsemblError, ValueError) as exc:
+        return f"# Error\n\n{exc}"
+
+    return formatters.format_fetch_variant_context(
+        ctx=ctx,
+        total_ms=(time.monotonic() - t0) * 1000.0,
+    )
+
+
+# ----------------------------------------------------------------------
+# Tool 11 — score_variant_at
+# ----------------------------------------------------------------------
+
+
+@mcp.tool()
+async def score_variant_at(
+    chromosome: str,
+    position: int,
+    ref_base: str,
+    alt_base: str,
+    window_size: int = 8192,
+    species: str = "human",
+    assembly: str = "GRCh38",
+    reduce_method: str = "mean",
+) -> str:
+    """Score a SNP by coordinate: fetch reference context then compute LL delta.
+
+    USE THIS WHEN:
+    - You have a variant as (chromosome, position, ref, alt) — the most common
+      form from VCF, VEP output, or clinical reports
+    - You want the pathogenicity signal in one tool call rather than a
+      manual fetch + score chain
+    - User asks "is this variant pathogenic?" with a coordinate
+
+    DO NOT USE WHEN:
+    - You only have a sequence in hand (no coordinate) → use `score_snp`
+    - You need to score many variants → use `score_variant_batch` (after
+      fetching contexts) or loop this tool — note Ensembl rate limit applies
+    - Variant is at a splice boundary → use `score_splice_region` after
+      fetching context
+
+    PARAMETERS:
+    - `chromosome`: chromosome name (e.g. "16", "X"). `chr` prefix is stripped.
+    - `position`: 1-based genomic coordinate of the variant.
+    - `ref_base`: single nucleotide (A/C/G/T/N) — must match the reference at
+      `position` on the chosen `assembly` (validated; mismatch → error).
+    - `alt_base`: single nucleotide — the alternative allele to score.
+    - `window_size`: flanking window in bp (default 8192, Arc Institute method).
+    - `species`: Ensembl species slug (default "human").
+    - `assembly`: "GRCh38" (default) or "GRCh37".
+    - `reduce_method`: "mean" (default, robust) or "sum".
+
+    INTERPRETATION:
+    - `score_delta = log_likelihood(alt_window) - log_likelihood(ref_window)`,
+      averaged over the window with `reduce_method='mean'`.
+    - For ~8 kb windows on the 40B model, observed magnitudes are small:
+      ~1e-4 to 1e-3 absolute. More negative → more disruptive.
+    - Heuristic ranges (combine with VEP, AlphaGenome, structure, literature):
+        `delta < -3e-4`: strong disruption signal
+        `-3e-4 ≤ delta < -1e-4`: moderate signal
+        `-1e-4 ≤ delta ≤ +1e-4`: weak/uncertain (VUS)
+        `delta > +1e-4`: variant scores higher than reference (rare; double-check)
+    - Do NOT use Evo2 alone for clinical classification.
+
+    Returns markdown with reference/mutated scores, delta, interpretation
+    band, and the genomic context used.
+    """
+    t0 = time.monotonic()
+
+    if len(ref_base) != 1 or len(alt_base) != 1:
+        return "# Error\n\n`ref_base` and `alt_base` must each be exactly one nucleotide."
+    if ref_base.upper() not in {"A", "C", "G", "T", "N"}:
+        return f"# Error\n\nInvalid `ref_base` {ref_base!r}. Use A/C/G/T/N."
+    if alt_base.upper() not in {"A", "C", "G", "T", "N"}:
+        return f"# Error\n\nInvalid `alt_base` {alt_base!r}. Use A/C/G/T/N."
+
+    ref_base_u = ref_base.upper()
+    alt_base_u = alt_base.upper()
+
+    try:
+        ctx: FetchedContext = await _get_ensembl().fetch_variant_context(
+            chromosome,
+            position,
+            window_size=window_size,
+            species=species,
+            assembly=assembly,
+        )
+    except (EnsemblError, ValueError) as exc:
+        return f"# Error fetching genomic context\n\n{exc}"
+
+    observed = ctx.sequence[ctx.center_index]
+    if observed != ref_base_u:
+        return (
+            f"# Reference allele mismatch\n\n"
+            f"You provided `ref_base={ref_base_u!r}` at `{ctx.chromosome}:{position}` "
+            f"({ctx.assembly}), but Ensembl returned `{observed!r}` at that position.\n\n"
+            "Likely causes:\n"
+            "- Wrong assembly (GRCh37 vs GRCh38)\n"
+            "- Off-by-one or 0-based vs 1-based coordinate convention\n"
+            "- Strand convention (Evo2 scores the forward strand of the reference)\n\n"
+            f"Window fetched: `{ctx.chromosome}:{ctx.start}..{ctx.end}` ({len(ctx.sequence)} bp)."
+        )
+
+    try:
+        mutated, mut_pos = apply_snp(ctx.sequence, alt_base_u, position=ctx.center_index)
+        nim = _get_client()
+        ref_logits, r_ms = await _forward_logits(nim, ctx.sequence)
+        alt_logits, a_ms = await _forward_logits(nim, mutated)
+        score_ref = log_likelihood_from_logits(
+            ref_logits, ctx.sequence, reduce_method=reduce_method
+        )
+        score_alt = log_likelihood_from_logits(
+            alt_logits, mutated, reduce_method=reduce_method
+        )
+    except (NimError, NimNotReadyError, NpzDecodeError, ScoringError) as exc:
+        return f"# Error scoring variant\n\n{exc}"
+
+    return formatters.format_score_variant_at(
+        ctx=ctx,
+        ref_base=ref_base_u,
+        alt_base=alt_base_u,
+        score_ref=score_ref,
+        score_alt=score_alt,
+        score_delta=score_alt - score_ref,
+        reduce_method=reduce_method,
+        server_ms=r_ms + a_ms,
+        total_ms=(time.monotonic() - t0) * 1000.0,
+    )

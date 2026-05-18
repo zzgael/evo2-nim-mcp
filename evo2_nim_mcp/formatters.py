@@ -271,6 +271,99 @@ Use these names verbatim when calling `embed_sequence(layer_name=...)` or
 """
 
 
+def format_fetch_variant_context(
+    *,
+    ctx,
+    total_ms: float | None,
+) -> str:
+    """Markdown summary of a successful Ensembl region fetch.
+
+    `ctx` is `evo2_nim_mcp.ensembl.FetchedContext`. Typed loosely to avoid an
+    import cycle in the formatters module.
+    """
+    seq = ctx.sequence
+    n = len(seq)
+    preview_radius = 30
+    if n <= 2 * preview_radius:
+        preview = seq
+    else:
+        c = ctx.center_index
+        left = max(0, c - preview_radius)
+        right = min(n, c + preview_radius + 1)
+        preview = f"…{seq[left:c]}[{seq[c]}]{seq[c+1:right]}…"
+
+    return f"""# Fetched genomic context
+
+## Result
+- **species**: {ctx.species}
+- **assembly**: {ctx.assembly}
+- **region**: `{ctx.chromosome}:{ctx.start}..{ctx.end}` ({n} bp returned)
+- **center_index**: {ctx.center_index} (0-based offset inside the returned sequence)
+- **reference base at center**: `{seq[ctx.center_index]}`
+
+## Sequence preview (centered on variant position)
+```
+{preview}
+```
+
+{_runtime_section(server_ms=None, total_ms=total_ms)}
+
+Pass the full sequence into `score_snp` with `position={ctx.center_index}` to
+score a variant at the centered coordinate, or use `score_variant_at` for the
+one-call equivalent.
+"""
+
+
+def format_score_variant_at(
+    *,
+    ctx,
+    ref_base: str,
+    alt_base: str,
+    score_ref: float,
+    score_alt: float,
+    score_delta: float,
+    reduce_method: str,
+    server_ms: float | None,
+    total_ms: float | None,
+) -> str:
+    """Markdown summary of `score_variant_at` (fetch + score combined)."""
+    # Interpretation band — heuristic only, matches systemPrompt guidance.
+    if score_delta < -3e-4:
+        band = "strong disruption signal"
+    elif score_delta < -1e-4:
+        band = "moderate disruption signal"
+    elif score_delta <= 1e-4:
+        band = "weak / uncertain (VUS range)"
+    else:
+        band = "alt scores higher than ref — double-check inputs"
+
+    return f"""# Evo2 variant score
+
+## Variant
+- **{ctx.chromosome}:{ctx.start + ctx.center_index} {ref_base}>{alt_base}** ({ctx.assembly})
+- **context window**: `{ctx.chromosome}:{ctx.start}..{ctx.end}` ({len(ctx.sequence)} bp)
+
+## Scores ({reduce_method} log-likelihood per position)
+- **LL(ref)**: {score_ref:.6f}
+- **LL(alt)**: {score_alt:.6f}
+- **delta**: {score_delta:+.6f}  →  *{band}*
+
+## Heuristic interpretation
+| delta range | signal |
+|---|---|
+| `< -3e-4` | strong disruption |
+| `-3e-4 .. -1e-4` | moderate |
+| `-1e-4 .. +1e-4` | weak / VUS |
+| `> +1e-4` | alt > ref (rare) |
+
+Evo2 is one signal — combine with VEP consequence, AlphaGenome regulatory
+prediction, AlphaFold structural impact, and literature before any clinical
+interpretation.
+
+{_runtime_section(server_ms, total_ms)}
+"""
+
+
 def format_nim_health(
     *,
     status: str,
