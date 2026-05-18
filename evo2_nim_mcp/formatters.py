@@ -285,6 +285,11 @@ def format_fetch_variant_context(
         right = min(n, c + preview_radius + 1)
         preview = f"…{seq[left:c]}[{seq[c]}]{seq[c+1:right]}…"
 
+    # FASTA-style wrap so the sequence is readable AND copy/paste-able into
+    # downstream tool calls (embed_similarity, score_snp). Don't omit anything.
+    LINE = 80
+    wrapped = "\n".join(seq[i : i + LINE] for i in range(0, n, LINE))
+
     return f"""# Fetched genomic context
 
 ## Result
@@ -294,16 +299,26 @@ def format_fetch_variant_context(
 - **center_index**: {ctx.center_index} (0-based offset inside the returned sequence)
 - **reference base at center**: `{seq[ctx.center_index]}`
 
-## Sequence preview (centered on variant position)
+## Sequence preview (centered on variant position, bracketed = reference base)
 ```
 {preview}
 ```
 
+## Full reference sequence ({n} bp)
+The complete sequence is below in FASTA-wrapped form. To use it in another
+tool (e.g. `embed_similarity`, `score_snp`), concatenate the lines into a
+single string with no newlines.
+
+```
+{wrapped}
+```
+
 {_runtime_section(server_ms=None, total_ms=total_ms)}
 
-Pass the full sequence into `score_snp` with `position={ctx.center_index}` to
-score a variant at the centered coordinate, or use `score_variant_at` for the
-one-call equivalent.
+Downstream usage:
+- `score_snp(sequence=<full above>, alternative_allele='X', position={ctx.center_index})` — score a specific SNV at the centered coordinate.
+- `score_variant_at(chromosome='{ctx.chromosome}', position={ctx.start + ctx.center_index}, ref_base='{seq[ctx.center_index]}', alt_base='X', assembly='{ctx.assembly}')` — one-call equivalent (re-fetches internally).
+- `embed_similarity(sequence_a=<this window>, sequence_b=<another window>)` — pairwise embedding comparison.
 """
 
 
