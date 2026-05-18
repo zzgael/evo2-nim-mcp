@@ -852,17 +852,45 @@ async def score_variant_at(
         return f"# Error fetching genomic context\n\n{exc}"
 
     observed = ctx.sequence[ctx.center_index]
+    complement = {"A": "T", "T": "A", "C": "G", "G": "C", "N": "N"}
+    strand_swap_note = None
     if observed != ref_base_u:
-        return (
-            f"# Reference allele mismatch\n\n"
-            f"You provided `ref_base={ref_base_u!r}` at `{ctx.chromosome}:{position}` "
-            f"({ctx.assembly}), but Ensembl returned `{observed!r}` at that position.\n\n"
-            "Likely causes:\n"
-            "- Wrong assembly (GRCh37 vs GRCh38)\n"
-            "- Off-by-one or 0-based vs 1-based coordinate convention\n"
-            "- Strand convention (Evo2 scores the forward strand of the reference)\n\n"
-            f"Window fetched: `{ctx.chromosome}:{ctx.start}..{ctx.end}` ({len(ctx.sequence)} bp)."
-        )
+        # Common cause: variant was reported on the gene's coding strand but
+        # the gene is on the reverse strand, so Ensembl returns the complement
+        # on the forward strand. Auto-recover if (comp(ref), comp(alt)) matches.
+        if complement.get(ref_base_u) == observed:
+            ref_was = (ref_base_u, alt_base_u)
+            ref_base_u = complement[ref_base_u]
+            alt_base_u = complement[alt_base_u]
+            strand_swap_note = (
+                f"Note: Ensembl reference at `{ctx.chromosome}:{position}` "
+                f"({ctx.assembly}) is `{observed}`, not `{ref_was[0]}`. The pair "
+                f"`{ref_was[0]}>{ref_was[1]}` is the **reverse-complement** "
+                f"convention (common for variants reported on a gene's coding "
+                f"strand when the gene is on the negative strand of the genome). "
+                f"Scored the forward-strand equivalent `{ref_base_u}>{alt_base_u}` instead — "
+                f"this gives the SAME biological variant under Evo2 (which is "
+                f"strand-agnostic for likelihood scoring). If you specifically "
+                f"need the user-provided strand, double-check the gene's strand "
+                f"in VEP / Ensembl before interpreting."
+            )
+        else:
+            return (
+                f"# Reference allele mismatch\n\n"
+                f"You provided `ref_base={ref_base_u!r}` at `{ctx.chromosome}:{position}` "
+                f"({ctx.assembly}), but Ensembl returned `{observed!r}` at that position.\n\n"
+                f"Neither `{ref_base_u}` nor its complement `{complement.get(ref_base_u, '?')}` "
+                f"matches the genome — this is NOT a simple strand convention issue.\n\n"
+                "Likely causes:\n"
+                "- Wrong assembly (the position itself has shifted between GRCh37 and GRCh38)\n"
+                "- Off-by-one or 0-based vs 1-based coordinate convention\n"
+                "- The variant was lifted-over from a different reference / coordinate system\n\n"
+                f"Window fetched: `{ctx.chromosome}:{ctx.start}..{ctx.end}` ({len(ctx.sequence)} bp).\n"
+                f"Reference base at that position: `{observed}`.\n"
+                f"Suggestion: try the other assembly (`assembly='GRCh37'` or "
+                f"`'GRCh38'`), or look up the rsID in dbSNP to get the canonical "
+                f"forward-strand coordinates."
+            )
 
     try:
         mutated, mut_pos = apply_snp(ctx.sequence, alt_base_u, position=ctx.center_index)
@@ -888,4 +916,5 @@ async def score_variant_at(
         reduce_method=reduce_method,
         server_ms=r_ms + a_ms,
         total_ms=(time.monotonic() - t0) * 1000.0,
+        strand_swap_note=strand_swap_note,
     )

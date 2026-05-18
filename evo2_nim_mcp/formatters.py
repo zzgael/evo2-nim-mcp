@@ -333,14 +333,19 @@ def format_score_variant_at(
     reduce_method: str,
     server_ms: float | None,
     total_ms: float | None,
+    strand_swap_note: str | None = None,
 ) -> str:
     """Markdown summary of `score_variant_at` (fetch + score combined)."""
+    swap_section = ""
+    if strand_swap_note:
+        swap_section = f"\n## ⚠ Strand convention auto-corrected\n{strand_swap_note}\n"
     return f"""# Evo2 variant score
 
 ## Variant
-- **{ctx.chromosome}:{ctx.start + ctx.center_index} {ref_base}>{alt_base}** ({ctx.assembly})
+- **{ctx.chromosome}:{ctx.start + ctx.center_index} {ref_base}>{alt_base}** ({ctx.assembly}, forward strand)
 - **context window**: `{ctx.chromosome}:{ctx.start}..{ctx.end}` ({len(ctx.sequence)} bp)
 - **reduce_method**: `{reduce_method}` (per-position log-likelihood, averaged over the window)
+{swap_section}
 
 ## Scores
 - **LL(ref)**: {score_ref:.6f}
