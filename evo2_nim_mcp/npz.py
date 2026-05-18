@@ -36,7 +36,10 @@ def decode_forward_response(data_b64: str) -> dict[str, np.ndarray]:
         )
 
     try:
-        raw = base64.b64decode(data_b64, validate=True)
+        # NIM returns MIME-style base64 with embedded newlines; strip whitespace
+        # before validating so the decode is still strict on actual character set.
+        compact = "".join(data_b64.split())
+        raw = base64.b64decode(compact, validate=True)
     except (ValueError, base64.binascii.Error) as exc:
         raise NpzDecodeError(f"NIM /forward returned non-base64 data: {exc}") from exc
 

@@ -1,72 +1,93 @@
 """Catalog of `output_layers` names accepted by the NIM `/forward` endpoint.
 
 The NIM container does not expose an introspection endpoint listing valid
-layer names. This catalog is curated empirically — names are confirmed by
-sending a tiny `/forward` request and checking the response payload.
-
-When deploying against a new NIM version, run the discovery script in
-`docs/nim-layer-names.md` and update this file.
+layer names, but the OpenAPI schema documents them. Names below are
+confirmed against `nvcr.io/nim/arc/evo2:2` (NIM 2.1.0, model 2.0.0).
 
 Conventions
 -----------
-- LM_HEAD: the layer that produces vocab logits (shape (seq_len, 512))
+- Request name vs response key: NIM always appends `.output` to the
+  requested layer name in the NPZ archive it returns. e.g. request
+  `output_layer` → NPZ key `output_layer.output`. Use `response_key()`.
+- LM_HEAD: the final logits layer (shape `(seq_len, 1, 512)`).
   → used by `score_sequence`, `score_snp`, `score_variant_batch`,
-    `score_splice_region`.
-- DEFAULT_EMBEDDING_LAYER: a hidden state useful as a generic embedding,
-  selected for general-purpose downstream classification per Evo2 paper
-  guidance ("intermediate layers like Block 20 (40B) often perform best").
-- RECOMMENDED_EMBEDDING_LAYERS: a curated subset to surface to LLMs via
-  `list_layer_names` so they know which layers are useful for which tasks.
+    `score_splice_region`. Vocab size 512.
+- DEFAULT_EMBEDDING_LAYER: a hidden state useful as a generic embedding.
+  NIM doc recommends the final MLP of an intermediate layer (capture
+  context-dependent features). Middle of the stack for the 40B model.
+- RECOMMENDED_EMBEDDING_LAYERS: a curated subset surfaced to LLMs via
+  `list_layer_names`.
+
+Architecture (per NIM /forward OpenAPI):
+- 7B: 32 layers (TransformerLayers at 3,10,17,24,31; HyenaLayers elsewhere)
+- 40B: 50 layers (TransformerLayers at 3,10,17,24,31,35,42,49; Hyena elsewhere)
+- Hidden dim: 8192 for 40B
 """
 
 from __future__ import annotations
 
-# These are placeholders until the Arkane trial confirms the actual layer names.
-# The values below are educated guesses based on Evo2 architecture conventions
-# (Hyena layers organized in blocks, byte-level vocab of 512). The trial will
-# either confirm them or replace them.
+# Layer name producing the LM head logits (final unembedding).
+# Confirmed against NIM 2.1.0 on Arkane H200 (2026-05-18).
+LM_HEAD_LAYER = "output_layer"
 
-# Layer name producing the LM head logits
-LM_HEAD_LAYER = "lm_head.output"
+# Default embedding layer: final MLP of a mid-stack layer, per NIM docs.
+# Hyena layer (not 3/10/17/24/31/35/42/49 — those are Transformer).
+DEFAULT_EMBEDDING_LAYER_40B = "decoder.layers.20.mlp"
+DEFAULT_EMBEDDING_LAYER_7B = "decoder.layers.16.mlp"
 
-# Default embedding layer for general-purpose use (40B model: middle block)
-DEFAULT_EMBEDDING_LAYER_40B = "blocks.20.output"
-DEFAULT_EMBEDDING_LAYER_7B = "blocks.16.output"
+
+def response_key(request_name: str) -> str:
+    """NIM appends `.output` to every requested layer name in the NPZ response.
+
+    Use this to look up the array after `decode_forward_response`.
+    """
+    return f"{request_name}.output"
+
 
 # Curated list surfaced via `list_layer_names`
 RECOMMENDED_LAYERS_40B: list[dict[str, str]] = [
     {
-        "name": "blocks.20.output",
-        "purpose": "general-purpose embeddings, classification",
-        "shape_hint": "(seq_len, 4096)",
+        "name": "decoder.layers.20.mlp",
+        "purpose": "general-purpose embeddings, classification (mid-stack Hyena MLP)",
+        "shape_hint": "(seq_len, 1, 8192)",
     },
     {
-        "name": "blocks.30.output",
+        "name": "decoder.layers.30.mlp",
         "purpose": "high-level features, language-modelling-aware embeddings",
-        "shape_hint": "(seq_len, 4096)",
+        "shape_hint": "(seq_len, 1, 8192)",
     },
     {
-        "name": "lm_head.output",
+        "name": "decoder.final_norm",
+        "purpose": "final normalised representations (closest to LM head)",
+        "shape_hint": "(seq_len, 1, 8192)",
+    },
+    {
+        "name": "output_layer",
         "purpose": "next-token logits (used internally for scoring)",
-        "shape_hint": "(seq_len, 512)",
+        "shape_hint": "(seq_len, 1, 512)",
     },
 ]
 
 RECOMMENDED_LAYERS_7B: list[dict[str, str]] = [
     {
-        "name": "blocks.2.mlp.l3",
-        "purpose": "low-level features (upstream evo2-mcp default)",
-        "shape_hint": "(seq_len, hidden_dim)",
+        "name": "decoder.layers.16.mlp",
+        "purpose": "general-purpose embeddings (mid-stack Hyena MLP)",
+        "shape_hint": "(seq_len, 1, hidden_dim)",
     },
     {
-        "name": "blocks.16.output",
-        "purpose": "general-purpose embeddings",
-        "shape_hint": "(seq_len, hidden_dim)",
+        "name": "decoder.layers.24.mlp",
+        "purpose": "higher-level features",
+        "shape_hint": "(seq_len, 1, hidden_dim)",
     },
     {
-        "name": "lm_head.output",
+        "name": "decoder.final_norm",
+        "purpose": "final normalised representations",
+        "shape_hint": "(seq_len, 1, hidden_dim)",
+    },
+    {
+        "name": "output_layer",
         "purpose": "next-token logits (used internally for scoring)",
-        "shape_hint": "(seq_len, 512)",
+        "shape_hint": "(seq_len, 1, 512)",
     },
 ]
 

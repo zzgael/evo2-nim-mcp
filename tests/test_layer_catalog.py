@@ -9,12 +9,18 @@ class TestRecommendedFor:
     def test_40b_returns_40b_catalog(self) -> None:
         layers = layer_catalog.recommended_for("evo2_40b")
         assert layers is layer_catalog.RECOMMENDED_LAYERS_40B
-        assert any(layer["name"] == "blocks.20.output" for layer in layers)
+        assert any(
+            layer["name"] == layer_catalog.DEFAULT_EMBEDDING_LAYER_40B
+            for layer in layers
+        )
 
     def test_7b_returns_7b_catalog(self) -> None:
         layers = layer_catalog.recommended_for("evo2_7b")
         assert layers is layer_catalog.RECOMMENDED_LAYERS_7B
-        assert any(layer["name"] == "blocks.16.output" for layer in layers)
+        assert any(
+            layer["name"] == layer_catalog.DEFAULT_EMBEDDING_LAYER_7B
+            for layer in layers
+        )
 
     def test_unknown_falls_back_to_40b(self) -> None:
         layers = layer_catalog.recommended_for("evo2_unknown")
@@ -28,11 +34,17 @@ class TestRecommendedFor:
 
 
 class TestDefaultEmbeddingLayer:
-    def test_40b_returns_block_20(self) -> None:
-        assert layer_catalog.default_embedding_layer("evo2_40b") == "blocks.20.output"
+    def test_40b_returns_decoder_mid_mlp(self) -> None:
+        assert (
+            layer_catalog.default_embedding_layer("evo2_40b")
+            == "decoder.layers.20.mlp"
+        )
 
-    def test_7b_returns_block_16(self) -> None:
-        assert layer_catalog.default_embedding_layer("evo2_7b") == "blocks.16.output"
+    def test_7b_returns_decoder_mid_mlp(self) -> None:
+        assert (
+            layer_catalog.default_embedding_layer("evo2_7b")
+            == "decoder.layers.16.mlp"
+        )
 
     def test_unknown_falls_back_to_40b_default(self) -> None:
         assert (
@@ -57,4 +69,16 @@ class TestCatalogShape:
             layer_catalog.RECOMMENDED_LAYERS_40B,
             layer_catalog.RECOMMENDED_LAYERS_7B,
         ):
-            assert any(layer["name"] == "lm_head.output" for layer in catalog)
+            assert any(
+                layer["name"] == layer_catalog.LM_HEAD_LAYER for layer in catalog
+            )
+
+
+class TestResponseKey:
+    def test_appends_dot_output(self) -> None:
+        # NIM always appends `.output` to the requested layer name in the NPZ.
+        assert layer_catalog.response_key("output_layer") == "output_layer.output"
+        assert (
+            layer_catalog.response_key("decoder.layers.20.mlp")
+            == "decoder.layers.20.mlp.output"
+        )

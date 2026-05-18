@@ -53,19 +53,28 @@ def _checkpoint_name() -> str:
 
 
 async def _forward_logits(client: NimClient, sequence: str) -> tuple[np.ndarray, float]:
-    """Call /forward with the LM head layer and return (logits, server_elapsed_ms)."""
+    """Call /forward with the LM head layer and return (logits, server_elapsed_ms).
+
+    NIM returns logits as a 3D tensor `(seq_len, 1, vocab)`. We squeeze the batch
+    dim down to `(seq_len, vocab)` so the scoring functions can consume it.
+    """
     response = await client.forward(
         {"sequence": sequence, "output_layers": [layer_catalog.LM_HEAD_LAYER]}
     )
     arrays = decode_forward_response(response.get("data", ""))
-    if layer_catalog.LM_HEAD_LAYER not in arrays:
+    key = layer_catalog.response_key(layer_catalog.LM_HEAD_LAYER)
+    if key not in arrays:
         raise NimError(
-            f"NIM /forward response did not contain layer "
-            f"{layer_catalog.LM_HEAD_LAYER!r}. Available: {list(arrays)}. "
-            "The layer name in `evo2_nim_mcp.layer_catalog` may be incorrect for "
-            "this NIM version — check `list_layer_names` and adjust if needed."
+            f"NIM /forward response did not contain key {key!r}. "
+            f"Available: {list(arrays)}. The layer name in "
+            "`evo2_nim_mcp.layer_catalog` may be incorrect for this NIM "
+            "version — check `list_layer_names` and adjust if needed."
         )
-    return arrays[layer_catalog.LM_HEAD_LAYER], float(response.get("elapsed_ms", 0.0))
+    logits = arrays[key]
+    # NIM returns (seq_len, batch=1, vocab); squeeze the batch dim.
+    if logits.ndim == 3 and logits.shape[1] == 1:
+        logits = logits.squeeze(axis=1)
+    return logits, float(response.get("elapsed_ms", 0.0))
 
 
 # ----------------------------------------------------------------------
@@ -388,15 +397,21 @@ async def embed_sequence(sequence: str, layer_name: str | None = None) -> str:
         client = _get_client()
         response = await client.forward({"sequence": sequence, "output_layers": [layer]})
         arrays = decode_forward_response(response.get("data", ""))
-        if layer not in arrays:
+        key = layer_catalog.response_key(layer)
+        if key not in arrays:
             return (
-                f"# Error\n\nNIM /forward did not return layer {layer!r}. "
-                f"Available layers in response: {list(arrays)}. "
+                f"# Error\n\nNIM /forward did not return key {key!r}. "
+                f"Available keys in response: {list(arrays)}. "
                 f"Call `list_layer_names` to see the catalog of supported layer names."
             )
-        embedding = arrays[layer]
+        embedding = arrays[key]
+        # NIM returns (seq_len, batch=1, hidden); squeeze batch to (seq_len, hidden).
+        if embedding.ndim == 3 and embedding.shape[1] == 1:
+            embedding = embedding.squeeze(axis=1)
         norms = np.linalg.norm(embedding.astype(np.float64), axis=-1)
-        summary_rows = ", ".join(f"{embedding[i, 0]:+.3f}" for i in range(min(5, embedding.shape[0])))
+        summary_rows = ", ".join(
+            f"{float(embedding[i, 0]):+.3f}" for i in range(min(5, embedding.shape[0]))
+        )
     except (NimError, NimNotReadyError, NpzDecodeError) as exc:
         return f"# Error\n\n{exc}"
 
