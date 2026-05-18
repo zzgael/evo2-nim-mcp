@@ -167,13 +167,15 @@ async def score_snp(
     - `position`: 0-based index of the base to mutate. Defaults to the center
       of the sequence (matches the upstream evo2-mcp convention).
 
-    INTERPRETATION:
-    - `score_delta` < 0 → mutated sequence less likely (often deleterious).
-    - `score_delta` ≈ 0 → mutation roughly neutral under the model.
-    - `score_delta` > 0 → mutated sequence more likely (rare; double-check inputs).
+    OUTPUT:
+    - `score_delta = LL(alt) − LL(ref)` (per-position log-likelihood, averaged
+      with `reduce_method='mean'`).
+    - Sign convention: negative delta = mutated window has lower likelihood
+      than the reference under the model. The magnitude carries no calibrated
+      mapping to clinical pathogenicity — it's a model-internal signal.
 
-    Returns markdown with reference score, mutated score, delta, and an
-    interpretation hint.
+    Returns markdown with LL(ref), LL(alt), delta, window length, and the
+    raw sequences. The caller is responsible for interpretation.
     """
     t0 = time.monotonic()
     try:
@@ -230,12 +232,13 @@ async def score_variant_batch(
         - `id` (str, optional): caller-provided identifier (echoed in output)
     - `reduce_method`: "mean" (default) or "sum"
 
-    INTERPRETATION:
-    - Output is a markdown table sorted in input order with one row per variant.
-    - Each row carries `score_delta` and a short interpretation tag
-      (deleterious / mild deleterious / neutral / gain).
+    OUTPUT:
+    - Markdown table sorted in input order, one row per variant, with
+      LL(ref), LL(alt), and `score_delta`.
     - Failures (bad inputs, NIM errors) are reported per-row without aborting
       the whole batch.
+    - No clinical / pathogenicity labels are attached — the caller does
+      interpretation.
 
     Returns markdown with summary statistics and per-variant table.
     """
@@ -311,12 +314,14 @@ async def score_splice_region(
     - `alternative_dinucleotide`: the variant dinucleotide (e.g. "GC" or "AT")
     - `reduce_method`: "mean" (default) or "sum"
 
-    INTERPRETATION:
-    - The output flags whether the reference is a canonical splice motif (GT/AG).
-    - A markedly negative `score_delta` on a canonical motif strongly suggests
-      splice site disruption.
+    OUTPUT:
+    - LL(ref), LL(alt), `score_delta`, and whether the reference dinucleotide
+      is a canonical donor (GT) or acceptor (AG) motif.
+    - For splice-effect prediction proper, prefer SpliceAI or AlphaGenome's
+      splice track — Evo2 is a generic DNA language model, not a splice
+      classifier.
 
-    Returns markdown with reference / mutated scores, delta, and motif interpretation.
+    Returns markdown with reference / mutated scores, delta, and motif type.
     """
     t0 = time.monotonic()
     try:
@@ -471,19 +476,18 @@ async def embed_similarity(
       checkpoint (`decoder.layers.20.mlp` for 40B). Both sequences are
       embedded at the same layer.
 
-    INTERPRETATION:
+    OUTPUT:
     - `cosine_similarity_mean_pool`: mean-pool each embedding over the
-      sequence dimension, then cosine of the two pooled vectors.
-      1.0 = identical, 0 = orthogonal, -1 = anti-parallel. Natural genomic
-      sequences typically cluster well above 0.9 with each other; values
-      far below that suggest large functional or compositional differences.
-    - `cosine_similarity_centered`: if both sequences have the same length,
-      also reports the average cosine across position-wise pairs (more
-      sensitive to local differences than mean-pool).
-    - These are similarity signals, not classifiers. Combine with
-      `score_variant_at`, VEP, and structural information for clinical use.
+      sequence dimension, then cosine of the two pooled vectors. Range
+      −1 (anti-parallel) to +1 (identical). Compares overall representation.
+    - `cosine_similarity_centered`: only when both sequences have the same
+      length — average cosine across position-wise pairs. More sensitive to
+      local differences than mean-pool.
+    - No published threshold maps cosine values to functional or clinical
+      categories. The useful pattern is comparing a panel of variants vs a
+      common reference, then ranking by divergence.
 
-    Returns markdown with the two metrics, the layer used, and runtime.
+    Returns markdown with both metrics, the layer used, and runtime.
     """
     t0 = time.monotonic()
     checkpoint = _checkpoint_name()
@@ -810,20 +814,19 @@ async def score_variant_at(
     - `assembly`: "GRCh38" (default) or "GRCh37".
     - `reduce_method`: "mean" (default, robust) or "sum".
 
-    INTERPRETATION:
-    - `score_delta = log_likelihood(alt_window) - log_likelihood(ref_window)`,
-      averaged over the window with `reduce_method='mean'`.
-    - For ~8 kb windows on the 40B model, observed magnitudes are small:
-      ~1e-4 to 1e-3 absolute. More negative → more disruptive.
-    - Heuristic ranges (combine with VEP, AlphaGenome, structure, literature):
-        `delta < -3e-4`: strong disruption signal
-        `-3e-4 ≤ delta < -1e-4`: moderate signal
-        `-1e-4 ≤ delta ≤ +1e-4`: weak/uncertain (VUS)
-        `delta > +1e-4`: variant scores higher than reference (rare; double-check)
-    - Do NOT use Evo2 alone for clinical classification.
+    OUTPUT:
+    - `score_delta = LL(alt) − LL(ref)`, both averaged per-position over the
+      window with `reduce_method='mean'`.
+    - For an 8 kb window on the 40B model, observed magnitudes are small:
+      typically 1e-4 to 1e-3 absolute. The sign indicates direction; the
+      magnitude is NOT a calibrated pathogenicity score. No published
+      threshold maps Evo2 deltas to ACMG categories.
+    - Zero-shot AUROC on Arc Institute's BRCA1 LOF benchmark is 0.73 for
+      Evo2-1B (Brixi et al 2025); the 40B is improved but still imperfect.
+      Treat the score as one piece of evidence, not a verdict.
 
-    Returns markdown with reference/mutated scores, delta, interpretation
-    band, and the genomic context used.
+    Returns markdown with LL(ref), LL(alt), delta, the genomic context used,
+    and an explicit reminder that this is not a clinical classifier.
     """
     t0 = time.monotonic()
 

@@ -54,22 +54,26 @@ class TestScoreSnp:
             total_ms=210,
         )
 
-    def test_strong_deleterious_interpretation(self) -> None:
+    def test_reports_ll_ref_and_alt(self) -> None:
         out = self._call(score_delta=-1.0)
-        assert "deleterious" in out.lower()
-        assert "markedly" in out.lower()
+        assert "LL(ref)" in out
+        assert "LL(alt)" in out
+        assert "-1.000000" in out  # both LL values printed at .6f
 
-    def test_mild_deleterious_interpretation(self) -> None:
-        out = self._call(score_delta=-0.3)
-        assert "mildly" in out.lower() or "mild" in out.lower()
+    def test_no_clinical_interpretation_labels(self) -> None:
+        """The formatter should NOT emit pseudo-clinical labels (deleterious,
+        neutral, gain, VUS) since Evo2 is not a clinical classifier and no
+        published threshold maps deltas to ACMG categories."""
+        for delta in (-1.0, -0.3, 0.05, 0.5):
+            out = self._call(score_delta=delta).lower()
+            for label in ("deleterious", "mild", "neutral", "gain (rare)", "vus range"):
+                assert label not in out, f"unexpected label '{label}' for delta={delta}"
 
-    def test_neutral_interpretation(self) -> None:
-        out = self._call(score_delta=0.05)
-        assert "neutral" in out.lower()
-
-    def test_gain_interpretation(self) -> None:
-        out = self._call(score_delta=0.5)
-        assert "more likely" in out.lower() or "gain" in out.lower() or "rare" in out.lower()
+    def test_explicit_not_a_classifier_disclaimer(self) -> None:
+        out = self._call(score_delta=-1.0).lower()
+        # disclaimer may wrap across lines — normalize whitespace
+        normalized = " ".join(out.split())
+        assert "not a clinical classifier" in normalized
 
     def test_includes_position_and_alleles_in_heading(self) -> None:
         out = self._call(score_delta=-1.0)
@@ -77,9 +81,9 @@ class TestScoreSnp:
         assert "A → G" in out
 
     def test_signed_delta_formatting(self) -> None:
-        # +/- prefix for the delta
-        assert "+0.5000" in self._call(0.5)
-        assert "-0.5000" in self._call(-0.5)
+        # +/- prefix for the delta (now .6f precision)
+        assert "+0.500000" in self._call(0.5)
+        assert "-0.500000" in self._call(-0.5)
 
 
 class TestScoreVariantBatch:
@@ -110,8 +114,12 @@ class TestScoreVariantBatch:
         )
         assert "variants scored**: 2/3" in out
         assert "failures**: 1" in out
-        assert "deleterious" in out.lower()
-        assert "neutral" in out.lower()
+        # raw numbers only — no clinical labels
+        for label in ("deleterious", "mild deleterious", "neutral", "gain (rare)"):
+            assert label not in out.lower(), f"unexpected label '{label}'"
+        # both LL columns and the delta should be present
+        assert "LL(ref)" in out
+        assert "LL(alt)" in out
         assert "bad input" in out
 
     def test_table_has_one_row_per_variant(self) -> None:
@@ -150,7 +158,11 @@ class TestScoreSpliceRegion:
             total_ms=420,
         )
         assert "canonical donor" in out.lower() or "canonical" in out.lower()
-        assert "splice loss" in out.lower() or "disruption" in out.lower()
+        # raw numbers, no clinical verdicts
+        assert "LL(ref)" in out
+        assert "LL(alt)" in out
+        for label in ("splice loss", "deleterious", "mild"):
+            assert label not in out.lower(), f"unexpected label '{label}'"
 
     def test_non_canonical_motif_called_out(self) -> None:
         out = formatters.format_score_splice_region(

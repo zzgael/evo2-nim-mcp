@@ -67,15 +67,6 @@ def format_score_snp(
     server_ms: float | None,
     total_ms: float | None,
 ) -> str:
-    if score_delta < -0.5:
-        interp = "mutated sequence is markedly less likely under the model (consistent with deleterious effect)"
-    elif score_delta < -0.1:
-        interp = "mutated sequence is mildly less likely (weak deleterious signal)"
-    elif score_delta <= 0.1:
-        interp = "mutation is approximately neutral under the model"
-    else:
-        interp = "mutated sequence is more likely than the reference (rare; double-check input)"
-
     short_ref = sequence if len(sequence) <= 60 else f"{sequence[:30]}…{sequence[-20:]}"
     short_alt = (
         mutated_sequence
@@ -85,16 +76,21 @@ def format_score_snp(
     return f"""# SNP score — position {position}, {reference_allele} → {alternative_allele}
 
 ## Result
-- **score_delta**: {score_delta:+.4f} ({reduce_method} log-likelihood)
-- **interpretation**: {interp}
-- **reference score**: {score_ref:.4f}
-- **mutated score**: {score_alt:.4f}
+- **score_delta**: {score_delta:+.6f}
+- **LL(ref)**: {score_ref:.6f}
+- **LL(alt)**: {score_alt:.6f}
+- **reduce_method**: `{reduce_method}` (per-position log-likelihood)
+- **window length**: {len(sequence)} nt
 
 ## Sequences
 - ref: `{short_ref}`
 - alt: `{short_alt}`
 
 {_runtime_section(server_ms, total_ms)}
+
+Sign convention: `delta = LL(alt) − LL(ref)`. The model is not a clinical
+classifier; interpret the score in conjunction with VEP consequence,
+AlphaGenome, structural prediction, population frequency, and literature.
 """
 
 
@@ -109,23 +105,18 @@ def format_score_variant_batch(
     successes = [r for r in results if "error" not in r]
     failures = [r for r in results if "error" in r]
 
-    rows = ["| # | position | ref | alt | score_delta | interpretation |", "|---|---|---|---|---|---|"]
+    rows = [
+        "| # | position | ref | alt | LL(ref) | LL(alt) | score_delta |",
+        "|---|---|---|---|---|---|---|",
+    ]
     for i, r in enumerate(results):
         if "error" in r:
-            rows.append(f"| {i} | — | — | — | — | error: {r['error']} |")
+            rows.append(f"| {i} | — | — | — | — | — | error: {r['error']} |")
             continue
-        delta = r["score_delta"]
-        if delta < -0.5:
-            note = "deleterious"
-        elif delta < -0.1:
-            note = "mild deleterious"
-        elif delta <= 0.1:
-            note = "neutral"
-        else:
-            note = "gain (rare)"
         rows.append(
             f"| {i} | {r['position']} | {r['reference_allele']} | "
-            f"{r['alternative_allele']} | {delta:+.4f} | {note} |"
+            f"{r['alternative_allele']} | {r['score_ref']:.6f} | "
+            f"{r['score_alt']:.6f} | {r['score_delta']:+.6f} |"
         )
 
     summary = (
@@ -159,28 +150,30 @@ def format_score_splice_region(
     server_ms: float | None,
     total_ms: float | None,
 ) -> str:
-    canonical_note = "canonical donor (GT) or acceptor (AG)" if canonical else "non-canonical splice motif"
-    if score_delta < -0.5:
-        interp = "splice site disruption is severely scored (consistent with splice loss)"
-    elif score_delta < -0.1:
-        interp = "splice site disruption shows mild deleterious signal"
-    else:
-        interp = "splice site change is roughly neutral under Evo2"
+    canonical_note = (
+        "canonical donor (GT) or acceptor (AG)"
+        if canonical
+        else "non-canonical motif (not a standard GT/AG splice site)"
+    )
 
     return f"""# Splice region score — position {splice_position}, {reference_dinucleotide} → {alternative_dinucleotide}
 
 ## Result
-- **score_delta**: {score_delta:+.4f}
-- **interpretation**: {interp}
+- **score_delta**: {score_delta:+.6f}
+- **LL(ref)**: {score_ref:.6f}
+- **LL(alt)**: {score_alt:.6f}
 - **motif type**: {canonical_note}
-- **reference score**: {score_ref:.4f}
-- **mutated score**: {score_alt:.4f}
 
 ## Region
 - splice position: {splice_position}
 - region length: {len(sequence)} nt
 
 {_runtime_section(server_ms, total_ms)}
+
+Sign convention: `delta = LL(alt) − LL(ref)`. The model is not a splice-site
+classifier — for splice-effect prediction, cross-reference with SpliceAI,
+AlphaGenome's splice track, and the variant's distance to the canonical
+donor/acceptor.
 """
 
 
@@ -327,40 +320,26 @@ def format_score_variant_at(
     total_ms: float | None,
 ) -> str:
     """Markdown summary of `score_variant_at` (fetch + score combined)."""
-    # Interpretation band — heuristic only, matches systemPrompt guidance.
-    if score_delta < -3e-4:
-        band = "strong disruption signal"
-    elif score_delta < -1e-4:
-        band = "moderate disruption signal"
-    elif score_delta <= 1e-4:
-        band = "weak / uncertain (VUS range)"
-    else:
-        band = "alt scores higher than ref — double-check inputs"
-
     return f"""# Evo2 variant score
 
 ## Variant
 - **{ctx.chromosome}:{ctx.start + ctx.center_index} {ref_base}>{alt_base}** ({ctx.assembly})
 - **context window**: `{ctx.chromosome}:{ctx.start}..{ctx.end}` ({len(ctx.sequence)} bp)
+- **reduce_method**: `{reduce_method}` (per-position log-likelihood, averaged over the window)
 
-## Scores ({reduce_method} log-likelihood per position)
+## Scores
 - **LL(ref)**: {score_ref:.6f}
 - **LL(alt)**: {score_alt:.6f}
-- **delta**: {score_delta:+.6f}  →  *{band}*
-
-## Heuristic interpretation
-| delta range | signal |
-|---|---|
-| `< -3e-4` | strong disruption |
-| `-3e-4 .. -1e-4` | moderate |
-| `-1e-4 .. +1e-4` | weak / VUS |
-| `> +1e-4` | alt > ref (rare) |
-
-Evo2 is one signal — combine with VEP consequence, AlphaGenome regulatory
-prediction, AlphaFold structural impact, and literature before any clinical
-interpretation.
+- **delta** (`LL(alt) − LL(ref)`): {score_delta:+.6f}
 
 {_runtime_section(server_ms, total_ms)}
+
+Evo2 returns a likelihood score — not a clinical classifier. The published
+zero-shot AUROC on the BRCA1 LOF vs FUNC/INT benchmark is 0.73 for Evo2-1B
+(Brixi et al 2025); 40B is improved but not perfect. Interpretation requires
+the clinician's judgement combined with VEP consequence, AlphaGenome
+regulatory/splice signal, AlphaFold structural impact, population frequency,
+and the existing literature on the variant.
 """
 
 
@@ -389,14 +368,18 @@ def format_embed_similarity(
 - **cosine_similarity_mean_pool**: {cosine_pool:+.4f}  (mean-pool each embedding, then cosine of the two pooled vectors)
 {pos_line}
 
-## Interpretation
-- 1.0 = identical embeddings; 0 = orthogonal; -1 = anti-parallel.
-- Natural genomic sequences typically score above 0.9 with each other under
-  mean-pool. A value notably below that signals large compositional or
-  functional differences.
-- This is a similarity signal, not a classifier — combine with
-  `score_variant_at`, VEP consequence, and structural prediction for any
-  clinical interpretation.
+## What cosine similarity means
+- Range: -1 (anti-parallel) to +1 (identical). 0 = orthogonal.
+- `cosine_similarity_mean_pool`: mean of the embedding tensor across
+  positions, then cosine of the two pooled vectors. Compares the *overall*
+  representation of each sequence.
+- `cosine_similarity_centered` (when lengths match): cosine at each position
+  averaged across positions. More sensitive to local differences.
+
+No published threshold maps cosine values to functional / clinical
+categories. Compare across a panel of variants (e.g. each variant vs the
+wild-type window) to rank by divergence; the absolute magnitude alone is
+not actionable.
 
 {_runtime_section(server_ms, total_ms)}
 """
