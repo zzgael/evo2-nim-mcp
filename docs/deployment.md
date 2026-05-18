@@ -72,32 +72,9 @@ EVO2_NIM_URL=http://localhost:8000 python -m evo2_nim_mcp
 | `EVO2_CONNECT_TIMEOUT` | `5` | TCP connect timeout in seconds |
 | `NIM_VARIANT` | `40b` | Read by `list_available_checkpoints` to label the loaded model. Should match the env var on the actual container. |
 
-## Workbench MCP config snippet
+## Wiring up an MCP client
 
-In a GPT Workbench-style healthcare integration:
-
-```typescript
-import { McpToolConfig } from '...';
-import { buildPythonPackageCheck } from '...';
-
-export const EVO2_MCP_CONFIG: McpToolConfig = {
-    command: 'bash',
-    args: [
-        '-c',
-        `${buildPythonPackageCheck(['evo2_nim_mcp'])} || ` +
-            'pip3 install --user --quiet --break-system-packages ' +
-            'git+https://github.com/zzgael/evo2-nim-mcp@<commit-sha> 2>/dev/null; ' +
-            'exec python3 -m evo2_nim_mcp',
-    ],
-    transport: 'stdio',
-    envMappings: [
-        { serverEnvVarName: 'EVO2_NIM_URL', valueSource: { type: 'SYSTEM_CONFIG', path: 'app.evo2.nimUrl' } },
-    ],
-    // ...
-};
-```
-
-Pin `<commit-sha>` to a known-good commit so deployments are reproducible.
+See the [README](../README.md#using-from-an-mcp-client) for ready-to-paste config snippets (Claude Desktop, Cursor, generic stdio).
 
 ## Verifying it works
 
