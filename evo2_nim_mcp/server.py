@@ -31,6 +31,22 @@ from evo2_nim_mcp.scoring import (
 
 mcp = FastMCP("Evo2 NIM")
 
+
+def _err(exc_or_message, **details) -> str:
+    """JSON error envelope returned by every tool on failure.
+
+    Shape: {"error": {"type": str, "message": str, ...details}}.
+    Keeps the result a parseable JSON string so the LLM only needs one parse path.
+    """
+    if isinstance(exc_or_message, BaseException):
+        payload = {"type": type(exc_or_message).__name__, "message": str(exc_or_message)}
+    else:
+        payload = {"type": "ToolError", "message": str(exc_or_message)}
+    if details:
+        payload.update(details)
+    return formatters.dump({"error": payload})
+
+
 # Single shared clients, lazily constructed on first call.
 _client: NimClient | None = None
 _ensembl: EnsemblClient | None = None
@@ -122,15 +138,14 @@ async def score_sequence(sequence: str, reduce_method: str = "mean") -> str:
         logits, server_ms = await _forward_logits(_get_client(), sequence)
         score = log_likelihood_from_logits(logits, sequence, reduce_method=reduce_method)
     except (NimError, NimNotReadyError, NpzDecodeError, ScoringError) as exc:
-        return f"# Error\n\n{exc}"
+        return _err(exc)
 
-    return formatters.format_score_sequence(
-        sequence=sequence,
-        score=score,
-        reduce_method=reduce_method,
-        server_ms=server_ms,
-        total_ms=(time.monotonic() - t0) * 1000.0,
-    )
+    return formatters.dump({
+        "sequence_length": len(sequence),
+        "score": score,
+        "reduce_method": reduce_method,
+        "runtime": formatters.runtime(server_ms, (time.monotonic() - t0) * 1000.0),
+    })
 
 
 # ----------------------------------------------------------------------
@@ -186,21 +201,19 @@ async def score_snp(
         score_ref = log_likelihood_from_logits(ref_logits, sequence, reduce_method=reduce_method)
         score_alt = log_likelihood_from_logits(alt_logits, mutated, reduce_method=reduce_method)
     except (NimError, NimNotReadyError, NpzDecodeError, ScoringError) as exc:
-        return f"# Error\n\n{exc}"
+        return _err(exc)
 
-    return formatters.format_score_snp(
-        sequence=sequence,
-        mutated_sequence=mutated,
-        position=pos,
-        reference_allele=sequence[pos],
-        alternative_allele=alternative_allele,
-        score_ref=score_ref,
-        score_alt=score_alt,
-        score_delta=score_alt - score_ref,
-        reduce_method=reduce_method,
-        server_ms=ref_server_ms + alt_server_ms,
-        total_ms=(time.monotonic() - t0) * 1000.0,
-    )
+    return formatters.dump({
+        "position": pos,
+        "reference_allele": sequence[pos],
+        "alternative_allele": alternative_allele,
+        "score_ref": score_ref,
+        "score_alt": score_alt,
+        "score_delta": score_alt - score_ref,
+        "reduce_method": reduce_method,
+        "window_length": len(sequence),
+        "runtime": formatters.runtime(ref_server_ms + alt_server_ms, (time.monotonic() - t0) * 1000.0),
+    })
 
 
 # ----------------------------------------------------------------------
@@ -271,12 +284,15 @@ async def score_variant_batch(
         except (NimError, NimNotReadyError, NpzDecodeError, ScoringError, KeyError) as exc:
             results.append({"id": v.get("id"), "error": str(exc)})
 
-    return formatters.format_score_variant_batch(
-        results=results,
-        reduce_method=reduce_method,
-        server_ms=server_ms_total,
-        total_ms=(time.monotonic() - t0) * 1000.0,
-    )
+    n_failures = sum(1 for r in results if "error" in r)
+    return formatters.dump({
+        "n": len(results),
+        "n_success": len(results) - n_failures,
+        "n_failures": n_failures,
+        "reduce_method": reduce_method,
+        "results": results,
+        "runtime": formatters.runtime(server_ms_total, (time.monotonic() - t0) * 1000.0),
+    })
 
 
 # ----------------------------------------------------------------------
@@ -353,20 +369,19 @@ async def score_splice_region(
         score_ref = log_likelihood_from_logits(ref_logits, sequence, reduce_method=reduce_method)
         score_alt = log_likelihood_from_logits(alt_logits, mutated, reduce_method=reduce_method)
     except (NimError, NimNotReadyError, NpzDecodeError, ScoringError) as exc:
-        return f"# Error\n\n{exc}"
+        return _err(exc)
 
-    return formatters.format_score_splice_region(
-        sequence=sequence,
-        splice_position=splice_position,
-        reference_dinucleotide=reference_dinucleotide,
-        alternative_dinucleotide=alternative_dinucleotide,
-        score_ref=score_ref,
-        score_alt=score_alt,
-        score_delta=score_alt - score_ref,
-        canonical=canonical,
-        server_ms=r_ms + a_ms,
-        total_ms=(time.monotonic() - t0) * 1000.0,
-    )
+    return formatters.dump({
+        "splice_position": splice_position,
+        "reference_dinucleotide": reference_dinucleotide,
+        "alternative_dinucleotide": alternative_dinucleotide,
+        "score_ref": score_ref,
+        "score_alt": score_alt,
+        "score_delta": score_alt - score_ref,
+        "canonical": canonical,
+        "region_length": len(sequence),
+        "runtime": formatters.runtime(r_ms + a_ms, (time.monotonic() - t0) * 1000.0),
+    })
 
 
 # ----------------------------------------------------------------------
@@ -413,10 +428,10 @@ async def embed_sequence(sequence: str, layer_name: str | None = None) -> str:
         arrays = decode_forward_response(response.get("data", ""))
         key = layer_catalog.response_key(layer)
         if key not in arrays:
-            return (
-                f"# Error\n\nNIM /forward did not return key {key!r}. "
-                f"Available keys in response: {list(arrays)}. "
-                f"Call `list_layer_names` to see the catalog of supported layer names."
+            return _err(
+                f"NIM /forward did not return key {key!r}",
+                available_keys=list(arrays),
+                hint="Call list_layer_names to see the catalog of supported layer names.",
             )
         embedding = arrays[key]
         # NIM returns (seq_len, batch=1, hidden); squeeze batch to (seq_len, hidden).
@@ -427,18 +442,20 @@ async def embed_sequence(sequence: str, layer_name: str | None = None) -> str:
             f"{float(embedding[i, 0]):+.3f}" for i in range(min(5, embedding.shape[0]))
         )
     except (NimError, NimNotReadyError, NpzDecodeError) as exc:
-        return f"# Error\n\n{exc}"
+        return _err(exc)
 
-    return formatters.format_embed_sequence(
-        sequence=sequence,
-        layer_name=layer,
-        embedding_shape=tuple(embedding.shape),
-        norm_mean=float(norms.mean()),
-        norm_std=float(norms.std()),
-        server_ms=float(response.get("elapsed_ms", 0.0)),
-        total_ms=(time.monotonic() - t0) * 1000.0,
-        embedding_summary=f"first column, first 5 positions: [{summary_rows}]",
-    )
+    return formatters.dump({
+        "layer_name": layer,
+        "sequence_length": len(sequence),
+        "embedding_shape": list(embedding.shape),
+        "norm_mean": float(norms.mean()),
+        "norm_std": float(norms.std()),
+        "sample_values_first_column": [float(embedding[i, 0]) for i in range(min(5, embedding.shape[0]))],
+        "runtime": formatters.runtime(
+            float(response.get("elapsed_ms", 0.0)),
+            (time.monotonic() - t0) * 1000.0,
+        ),
+    })
 
 
 # ----------------------------------------------------------------------
@@ -512,7 +529,7 @@ async def embed_similarity(
         emb_a, ms_a = await _embed(sequence_a)
         emb_b, ms_b = await _embed(sequence_b)
     except (NimError, NimNotReadyError, NpzDecodeError) as exc:
-        return f"# Error\n\n{exc}"
+        return _err(exc)
 
     def _cos(u: np.ndarray, v: np.ndarray) -> float:
         nu = float(np.linalg.norm(u))
@@ -534,15 +551,14 @@ async def embed_similarity(
         )
         cos_pos = float(per_pos.mean())
 
-    return formatters.format_embed_similarity(
-        sequence_a_len=len(sequence_a),
-        sequence_b_len=len(sequence_b),
-        layer_name=layer,
-        cosine_pool=cos_pool,
-        cosine_position_mean=cos_pos,
-        server_ms=ms_a + ms_b,
-        total_ms=(time.monotonic() - t0) * 1000.0,
-    )
+    return formatters.dump({
+        "layer_name": layer,
+        "sequence_a_length": len(sequence_a),
+        "sequence_b_length": len(sequence_b),
+        "cosine_similarity_mean_pool": cos_pool,
+        "cosine_similarity_centered": cos_pos,
+        "runtime": formatters.runtime(ms_a + ms_b, (time.monotonic() - t0) * 1000.0),
+    })
 
 
 # ----------------------------------------------------------------------
@@ -603,19 +619,20 @@ async def generate_sequence(
     try:
         response = await _get_client().generate(payload)
     except (NimError, NimNotReadyError) as exc:
-        return f"# Error\n\n{exc}"
+        return _err(exc)
 
     generated = response.get("sequence", "")
     server_ms = float(response.get("elapsed_ms", 0.0))
-    return formatters.format_generate_sequence(
-        prompt=prompt,
-        generated=generated,
-        n_tokens=n_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        server_ms=server_ms,
-        total_ms=(time.monotonic() - t0) * 1000.0,
-    )
+    return formatters.dump({
+        "prompt": prompt,
+        "generated": generated,
+        "n_tokens": n_tokens,
+        "temperature": temperature,
+        "top_k": top_k,
+        "prompt_length": len(prompt),
+        "generated_length": len(generated),
+        "runtime": formatters.runtime(server_ms, (time.monotonic() - t0) * 1000.0),
+    })
 
 
 # ----------------------------------------------------------------------
@@ -642,9 +659,10 @@ async def list_available_checkpoints() -> str:
         f"{'40B parameters, 1M context window' if '40b' in checkpoint else '7B parameters, 1M context window' if '7b' in checkpoint else 'configuration unknown'}. "
         "Loaded in this NIM container."
     )
-    return formatters.format_list_checkpoints(
-        [{"name": checkpoint, "description": description}]
-    )
+    return formatters.dump({
+        "checkpoints": [{"name": checkpoint, "description": description}],
+        "note": "One checkpoint per NIM container; configured at deploy time via NIM_VARIANT.",
+    })
 
 
 # ----------------------------------------------------------------------
@@ -668,7 +686,7 @@ async def list_layer_names() -> str:
     """
     checkpoint = _checkpoint_name()
     layers = layer_catalog.recommended_for(checkpoint)
-    return formatters.format_list_layer_names(checkpoint, layers)
+    return formatters.dump({"checkpoint": checkpoint, "layers": layers})
 
 
 # ----------------------------------------------------------------------
@@ -691,19 +709,23 @@ async def nim_health() -> str:
     client = _get_client()
     try:
         body = await client.health()
-        return formatters.format_nim_health(
-            status="ready",
-            base_url=client.base_url,
-            extra={k: v for k, v in body.items() if k != "status"} or None,
-        )
+        return formatters.dump({
+            "status": "ready",
+            "endpoint": client.base_url,
+            "extra": {k: v for k, v in body.items() if k != "status"} or None,
+        })
     except NimNotReadyError as exc:
-        return formatters.format_nim_health(
-            status=f"not ready ({exc})", base_url=client.base_url
-        )
+        return formatters.dump({
+            "status": "not_ready",
+            "endpoint": client.base_url,
+            "extra": {"detail": str(exc)},
+        })
     except NimError as exc:
-        return formatters.format_nim_health(
-            status=f"unreachable ({exc})", base_url=client.base_url
-        )
+        return formatters.dump({
+            "status": "unreachable",
+            "endpoint": client.base_url,
+            "extra": {"detail": str(exc)},
+        })
 
 
 # ----------------------------------------------------------------------
@@ -763,12 +785,20 @@ async def fetch_variant_context(
             assembly=assembly,
         )
     except (EnsemblError, ValueError) as exc:
-        return f"# Error\n\n{exc}"
+        return _err(exc)
 
-    return formatters.format_fetch_variant_context(
-        ctx=ctx,
-        total_ms=(time.monotonic() - t0) * 1000.0,
-    )
+    return formatters.dump({
+        "species": ctx.species,
+        "assembly": ctx.assembly,
+        "chromosome": ctx.chromosome,
+        "start": ctx.start,
+        "end": ctx.end,
+        "length": len(ctx.sequence),
+        "center_index": ctx.center_index,
+        "reference_base_at_center": ctx.sequence[ctx.center_index],
+        "sequence": ctx.sequence,
+        "runtime": formatters.runtime(None, (time.monotonic() - t0) * 1000.0),
+    })
 
 
 # ----------------------------------------------------------------------
@@ -831,11 +861,11 @@ async def score_variant_at(
     t0 = time.monotonic()
 
     if len(ref_base) != 1 or len(alt_base) != 1:
-        return "# Error\n\n`ref_base` and `alt_base` must each be exactly one nucleotide."
+        return _err("ref_base and alt_base must each be exactly one nucleotide.")
     if ref_base.upper() not in {"A", "C", "G", "T", "N"}:
-        return f"# Error\n\nInvalid `ref_base` {ref_base!r}. Use A/C/G/T/N."
+        return _err(f"Invalid ref_base {ref_base!r}. Use A/C/G/T/N.")
     if alt_base.upper() not in {"A", "C", "G", "T", "N"}:
-        return f"# Error\n\nInvalid `alt_base` {alt_base!r}. Use A/C/G/T/N."
+        return _err(f"Invalid alt_base {alt_base!r}. Use A/C/G/T/N.")
 
     ref_base_u = ref_base.upper()
     alt_base_u = alt_base.upper()
@@ -849,7 +879,7 @@ async def score_variant_at(
             assembly=assembly,
         )
     except (EnsemblError, ValueError) as exc:
-        return f"# Error fetching genomic context\n\n{exc}"
+        return _err(exc, stage="ensembl_fetch_context")
 
     observed = ctx.sequence[ctx.center_index]
     complement = {"A": "T", "T": "A", "C": "G", "G": "C", "N": "N"}
@@ -875,21 +905,26 @@ async def score_variant_at(
                 f"in VEP / Ensembl before interpreting."
             )
         else:
-            return (
-                f"# Reference allele mismatch\n\n"
-                f"You provided `ref_base={ref_base_u!r}` at `{ctx.chromosome}:{position}` "
-                f"({ctx.assembly}), but Ensembl returned `{observed!r}` at that position.\n\n"
-                f"Neither `{ref_base_u}` nor its complement `{complement.get(ref_base_u, '?')}` "
-                f"matches the genome — this is NOT a simple strand convention issue.\n\n"
-                "Likely causes:\n"
-                "- Wrong assembly (the position itself has shifted between GRCh37 and GRCh38)\n"
-                "- Off-by-one or 0-based vs 1-based coordinate convention\n"
-                "- The variant was lifted-over from a different reference / coordinate system\n\n"
-                f"Window fetched: `{ctx.chromosome}:{ctx.start}..{ctx.end}` ({len(ctx.sequence)} bp).\n"
-                f"Reference base at that position: `{observed}`.\n"
-                f"Suggestion: try the other assembly (`assembly='GRCh37'` or "
-                f"`'GRCh38'`), or look up the rsID in dbSNP to get the canonical "
-                f"forward-strand coordinates."
+            return _err(
+                "Reference allele mismatch: neither the supplied ref nor its complement "
+                "matches the Ensembl base at that position.",
+                stage="reference_validation",
+                supplied_ref=ref_base_u,
+                observed_base=observed,
+                supplied_ref_complement=complement.get(ref_base_u),
+                chromosome=ctx.chromosome,
+                position=position,
+                assembly=ctx.assembly,
+                window={"start": ctx.start, "end": ctx.end, "length": len(ctx.sequence)},
+                likely_causes=[
+                    "wrong assembly (position itself differs between GRCh37 and GRCh38)",
+                    "off-by-one / 0-based vs 1-based coordinate convention",
+                    "variant lifted-over from a different reference",
+                ],
+                suggestions=[
+                    "try the other assembly",
+                    "look up the rsID in dbSNP for canonical forward-strand coordinates",
+                ],
             )
 
     try:
@@ -904,17 +939,28 @@ async def score_variant_at(
             alt_logits, mutated, reduce_method=reduce_method
         )
     except (NimError, NimNotReadyError, NpzDecodeError, ScoringError) as exc:
-        return f"# Error scoring variant\n\n{exc}"
+        return _err(exc, stage="nim_scoring")
 
-    return formatters.format_score_variant_at(
-        ctx=ctx,
-        ref_base=ref_base_u,
-        alt_base=alt_base_u,
-        score_ref=score_ref,
-        score_alt=score_alt,
-        score_delta=score_alt - score_ref,
-        reduce_method=reduce_method,
-        server_ms=r_ms + a_ms,
-        total_ms=(time.monotonic() - t0) * 1000.0,
-        strand_swap_note=strand_swap_note,
-    )
+    return formatters.dump({
+        "variant": {
+            "chromosome": ctx.chromosome,
+            "position": ctx.start + ctx.center_index,
+            "ref": ref_base_u,
+            "alt": alt_base_u,
+            "assembly": ctx.assembly,
+        },
+        "context": {
+            "chromosome": ctx.chromosome,
+            "start": ctx.start,
+            "end": ctx.end,
+            "length": len(ctx.sequence),
+        },
+        "scores": {
+            "score_ref": score_ref,
+            "score_alt": score_alt,
+            "score_delta": score_alt - score_ref,
+            "reduce_method": reduce_method,
+        },
+        "strand_swap_note": strand_swap_note,
+        "runtime": formatters.runtime(r_ms + a_ms, (time.monotonic() - t0) * 1000.0),
+    })

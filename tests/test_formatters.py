@@ -1,287 +1,109 @@
-"""Snapshot-style tests for evo2_nim_mcp.formatters.
+"""Round-trip / shape tests for evo2_nim_mcp.formatters JSON helpers.
 
-These tests don't compare full strings — they assert that key structural
-elements (headings, fields, interpretation hints) are present in the output,
-so small wording tweaks don't fail the suite.
+The markdown formatters were removed when we switched to JSON-only tool output.
+What remains in the module is the `dump` helper (NaN-safe + numpy-aware
+json.dumps) and a small `runtime` envelope. Both are exercised here.
+
+Tests that the old `format_*` functions are gone live at the bottom — a
+canary against regressions where someone reintroduces a markdown path.
 """
 
 from __future__ import annotations
 
+import json
+import math
+
+import numpy as np
+
 from evo2_nim_mcp import formatters
 
 
-class TestScoreSequence:
-    def test_includes_score_and_length(self) -> None:
-        out = formatters.format_score_sequence(
-            sequence="ACGTACGT",
-            score=-1.234,
-            reduce_method="mean",
-            server_ms=100,
-            total_ms=110,
-        )
-        assert "# Sequence likelihood score" in out
-        assert "-1.2340" in out
-        assert "8 nt" in out
-        assert "mean" in out
-        assert "100 ms" in out
-        assert "110 ms" in out
-
-    def test_truncates_long_sequence_in_preview(self) -> None:
-        long_seq = "A" * 100
-        out = formatters.format_score_sequence(
-            sequence=long_seq, score=0.0, reduce_method="mean", server_ms=1, total_ms=1
-        )
-        # Truncated form contains an ellipsis
-        assert "…" in out
-        # But the length field shows the real length
-        assert "100 nt" in out
+def test_dump_nan_inf_coerced():
+    out = json.loads(formatters.dump({"a": float("nan"), "b": float("inf"), "c": 1.5}))
+    assert out == {"a": None, "b": None, "c": 1.5}
 
 
-class TestScoreSnp:
-    def _call(self, score_delta: float) -> str:
-        score_alt = -1.0 + score_delta
-        return formatters.format_score_snp(
-            sequence="ACGTACGT",
-            mutated_sequence="ACGTGCGT",
-            position=4,
-            reference_allele="A",
-            alternative_allele="G",
-            score_ref=-1.0,
-            score_alt=score_alt,
-            score_delta=score_delta,
-            reduce_method="mean",
-            server_ms=200,
-            total_ms=210,
-        )
-
-    def test_reports_ll_ref_and_alt(self) -> None:
-        out = self._call(score_delta=-1.0)
-        assert "LL(ref)" in out
-        assert "LL(alt)" in out
-        assert "-1.000000" in out  # both LL values printed at .6f
-
-    def test_no_clinical_interpretation_labels(self) -> None:
-        """The formatter should NOT emit pseudo-clinical labels (deleterious,
-        neutral, gain, VUS) since Evo2 is not a clinical classifier and no
-        published threshold maps deltas to ACMG categories."""
-        for delta in (-1.0, -0.3, 0.05, 0.5):
-            out = self._call(score_delta=delta).lower()
-            for label in ("deleterious", "mild", "neutral", "gain (rare)", "vus range"):
-                assert label not in out, f"unexpected label '{label}' for delta={delta}"
-
-    def test_explicit_not_a_classifier_disclaimer(self) -> None:
-        out = self._call(score_delta=-1.0).lower()
-        # disclaimer may wrap across lines — normalize whitespace
-        normalized = " ".join(out.split())
-        assert "not a clinical classifier" in normalized
-
-    def test_includes_position_and_alleles_in_heading(self) -> None:
-        out = self._call(score_delta=-1.0)
-        assert "position 4" in out
-        assert "A → G" in out
-
-    def test_signed_delta_formatting(self) -> None:
-        # +/- prefix for the delta (now .6f precision)
-        assert "+0.500000" in self._call(0.5)
-        assert "-0.500000" in self._call(-0.5)
+def test_dump_numpy_scalars():
+    out = json.loads(formatters.dump({
+        "i": np.int64(42),
+        "f": np.float32(2.5),
+        "f_nan": np.float64(np.nan),
+        "b": np.bool_(False),
+        "arr": np.array([0.0, np.nan]),
+    }))
+    assert out == {"i": 42, "f": 2.5, "f_nan": None, "b": False, "arr": [0.0, None]}
 
 
-class TestScoreVariantBatch:
-    def test_summary_counts_failures(self) -> None:
-        results = [
-            {
-                "id": "v1",
-                "position": 4,
-                "reference_allele": "A",
-                "alternative_allele": "G",
-                "score_ref": -1.0,
-                "score_alt": -2.0,
-                "score_delta": -1.0,
-            },
-            {"id": "v2", "error": "bad input"},
-            {
-                "id": "v3",
-                "position": 4,
-                "reference_allele": "C",
-                "alternative_allele": "T",
-                "score_ref": -1.0,
-                "score_alt": -1.05,
-                "score_delta": -0.05,
-            },
-        ]
-        out = formatters.format_score_variant_batch(
-            results=results, reduce_method="mean", server_ms=300, total_ms=310
-        )
-        assert "variants scored**: 2/3" in out
-        assert "failures**: 1" in out
-        # raw numbers only — no clinical labels
-        for label in ("deleterious", "mild deleterious", "neutral", "gain (rare)"):
-            assert label not in out.lower(), f"unexpected label '{label}'"
-        # both LL columns and the delta should be present
-        assert "LL(ref)" in out
-        assert "LL(alt)" in out
-        assert "bad input" in out
-
-    def test_table_has_one_row_per_variant(self) -> None:
-        results = [
-            {
-                "id": f"v{i}",
-                "position": 4,
-                "reference_allele": "A",
-                "alternative_allele": "G",
-                "score_ref": -1.0,
-                "score_alt": -1.5,
-                "score_delta": -0.5,
-            }
-            for i in range(5)
-        ]
-        out = formatters.format_score_variant_batch(
-            results=results, reduce_method="mean", server_ms=1, total_ms=1
-        )
-        # Each row index 0..4 should appear in a table cell
-        for i in range(5):
-            assert f"| {i} |" in out
+def test_runtime_envelope():
+    rt = formatters.runtime(12.5, 30.0)
+    assert rt == {"server_ms": 12.5, "total_ms": 30.0}
+    rt_none = formatters.runtime(None, None)
+    assert rt_none == {"server_ms": None, "total_ms": None}
 
 
-class TestScoreSpliceRegion:
-    def test_canonical_donor_motif_called_out(self) -> None:
-        out = formatters.format_score_splice_region(
-            sequence="A" * 20 + "GT" + "A" * 20,
-            splice_position=20,
-            reference_dinucleotide="GT",
-            alternative_dinucleotide="GC",
-            score_ref=-1.0,
-            score_alt=-2.5,
-            score_delta=-1.5,
-            canonical=True,
-            server_ms=400,
-            total_ms=420,
-        )
-        assert "canonical donor" in out.lower() or "canonical" in out.lower()
-        # raw numbers, no clinical verdicts
-        assert "LL(ref)" in out
-        assert "LL(alt)" in out
-        for label in ("splice loss", "deleterious", "mild"):
-            assert label not in out.lower(), f"unexpected label '{label}'"
-
-    def test_non_canonical_motif_called_out(self) -> None:
-        out = formatters.format_score_splice_region(
-            sequence="ACGTAC" + "TT" + "ACGT",
-            splice_position=6,
-            reference_dinucleotide="TT",
-            alternative_dinucleotide="GG",
-            score_ref=-1.0,
-            score_alt=-1.05,
-            score_delta=-0.05,
-            canonical=False,
-            server_ms=400,
-            total_ms=420,
-        )
-        assert "non-canonical" in out.lower()
+def test_dump_round_trips_a_realistic_score_payload():
+    # Mirrors what server.py's score_variant_at builds inline.
+    payload = {
+        "variant": {
+            "chromosome": "chr1",
+            "position": 196716375,
+            "ref": "T",
+            "alt": "C",
+            "assembly": "GRCh38",
+        },
+        "context": {
+            "chromosome": "chr1",
+            "start": 196712183,
+            "end": 196720375,
+            "length": 8192,
+        },
+        "scores": {
+            "score_ref": -0.676672,
+            "score_alt": -0.677868,
+            "score_delta": -0.001196,
+            "reduce_method": "mean",
+        },
+        "strand_swap_note": None,
+        "runtime": formatters.runtime(2300.0, 2310.0),
+    }
+    s = formatters.dump(payload)
+    out = json.loads(s)
+    assert out["variant"]["position"] == 196716375
+    assert math.isclose(out["scores"]["score_delta"], -0.001196, rel_tol=1e-6)
+    assert out["strand_swap_note"] is None
+    assert out["runtime"]["server_ms"] == 2300.0
 
 
-class TestEmbedSequence:
-    def test_includes_layer_and_shape(self) -> None:
-        out = formatters.format_embed_sequence(
-            sequence="ACGTACGT",
-            layer_name="blocks.20.output",
-            embedding_shape=(8, 4096),
-            norm_mean=12.5,
-            norm_std=2.1,
-            server_ms=500,
-            total_ms=510,
-            embedding_summary=None,
-        )
-        assert "blocks.20.output" in out
-        assert "(8, 4096)" in out
-        assert "12.500" in out
-        assert "2.100" in out
-
-    def test_includes_embedding_summary_when_provided(self) -> None:
-        out = formatters.format_embed_sequence(
-            sequence="ACGT",
-            layer_name="blocks.20.output",
-            embedding_shape=(4, 4096),
-            norm_mean=10.0,
-            norm_std=1.0,
-            server_ms=100,
-            total_ms=110,
-            embedding_summary="first column: [+0.123, -0.456, +0.789]",
-        )
-        assert "first column" in out
+def test_dump_compact_separators():
+    """No whitespace between keys/values — keeps payload tight on the wire."""
+    s = formatters.dump({"a": 1, "b": 2})
+    assert "," in s and " " not in s
 
 
-class TestGenerateSequence:
-    def test_includes_lengths_and_temperature(self) -> None:
-        out = formatters.format_generate_sequence(
-            prompt="ACGT",
-            generated="ACGTACGTACGT",
-            n_tokens=8,
-            temperature=0.7,
-            top_k=4,
-            server_ms=2000,
-            total_ms=2050,
-        )
-        assert "12 nt" in out
-        assert "0.7" in out
-        assert "top_k**: 4" in out
-        assert "ACGTACGTACGT" in out
-
-    def test_truncates_very_long_generated_sequence(self) -> None:
-        out = formatters.format_generate_sequence(
-            prompt="ACGT",
-            generated="A" * 5000,
-            n_tokens=5000,
-            temperature=0.7,
-            top_k=4,
-            server_ms=10000,
-            total_ms=10100,
-        )
-        assert "5000 nt" in out
-        # Should not splat 5000 'A's into the markdown
-        assert out.count("A" * 1000) == 0
+def test_invalid_nonfinite_inside_nested_list():
+    payload = {"results": [{"score": float("nan")}, {"score": 0.5}]}
+    out = json.loads(formatters.dump(payload))
+    assert out["results"][0]["score"] is None
+    assert out["results"][1]["score"] == 0.5
 
 
-class TestListCheckpoints:
-    def test_renders_table(self) -> None:
-        out = formatters.format_list_checkpoints(
-            [{"name": "evo2_40b", "description": "Big model"}]
-        )
-        assert "| name | description |" in out
-        assert "evo2_40b" in out
-        assert "Big model" in out
+def test_no_markdown_formatters_left():
+    """Canary: the old format_* functions are removed; only dump + runtime remain.
 
-
-class TestListLayerNames:
-    def test_renders_table_with_purpose_and_shape(self) -> None:
-        out = formatters.format_list_layer_names(
-            "evo2_40b",
-            [
-                {"name": "blocks.20.output", "purpose": "embeddings", "shape_hint": "(n, 4096)"},
-                {"name": "lm_head.output", "purpose": "logits", "shape_hint": "(n, 512)"},
-            ],
-        )
-        assert "evo2_40b" in out
-        assert "blocks.20.output" in out
-        assert "embeddings" in out
-        assert "lm_head.output" in out
-        assert "(n, 4096)" in out
-
-
-class TestNimHealth:
-    def test_ready_status(self) -> None:
-        out = formatters.format_nim_health(
-            status="ready", base_url="http://localhost:8000"
-        )
-        assert "ready" in out
-        assert "http://localhost:8000" in out
-
-    def test_extra_metadata(self) -> None:
-        out = formatters.format_nim_health(
-            status="ready",
-            base_url="http://localhost:8000",
-            extra={"version": "2.1.0", "uptime_s": 1234},
-        )
-        assert "version" in out
-        assert "2.1.0" in out
-        assert "1234" in out
+    If anyone reintroduces markdown rendering at this layer, this test fires.
+    """
+    for attr in (
+        "format_score_sequence",
+        "format_score_snp",
+        "format_score_variant_batch",
+        "format_score_splice_region",
+        "format_embed_sequence",
+        "format_embed_similarity",
+        "format_generate_sequence",
+        "format_list_checkpoints",
+        "format_list_layer_names",
+        "format_fetch_variant_context",
+        "format_score_variant_at",
+        "format_nim_health",
+    ):
+        assert not hasattr(formatters, attr), f"{attr} should have been removed"
