@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 from fastmcp import FastMCP
 
-from evo2_nim_mcp import formatters, layer_catalog
+from evo2_nim_mcp import cache, formatters, layer_catalog
 from evo2_nim_mcp.client import NimClient, NimError, NimNotReadyError
 from evo2_nim_mcp.ensembl import EnsemblClient, EnsemblError, FetchedContext
 from evo2_nim_mcp.npz import NpzDecodeError, decode_forward_response
@@ -134,16 +134,31 @@ async def score_sequence(sequence: str, reduce_method: str = "mean") -> str:
     Returns a markdown report with the score, sequence preview, and runtime.
     """
     t0 = time.monotonic()
+    cached = cache.get("score_sequence", cache.score_sequence_key(sequence, reduce_method))
+    if cached is not None:
+        return formatters.dump({
+            "sequence_length": len(sequence),
+            "score": cached["score"],
+            "reduce_method": reduce_method,
+            "cache": {"hit": True, "saved_server_ms": cached.get("server_ms")},
+            "runtime": formatters.runtime(0, (time.monotonic() - t0) * 1000.0),
+        })
     try:
         logits, server_ms = await _forward_logits(_get_client(), sequence)
         score = log_likelihood_from_logits(logits, sequence, reduce_method=reduce_method)
     except (NimError, NimNotReadyError, NpzDecodeError, ScoringError) as exc:
         return _err(exc)
 
+    cache.put(
+        "score_sequence",
+        cache.score_sequence_key(sequence, reduce_method),
+        {"score": score, "server_ms": server_ms},
+    )
     return formatters.dump({
         "sequence_length": len(sequence),
         "score": score,
         "reduce_method": reduce_method,
+        "cache": {"hit": False},
         "runtime": formatters.runtime(server_ms, (time.monotonic() - t0) * 1000.0),
     })
 
@@ -193,6 +208,23 @@ async def score_snp(
     raw sequences. The caller is responsible for interpretation.
     """
     t0 = time.monotonic()
+    cached = cache.get(
+        "score_snp",
+        cache.score_snp_key(sequence, alternative_allele, position, reduce_method),
+    )
+    if cached is not None:
+        return formatters.dump({
+            "position": cached["position"],
+            "reference_allele": cached["reference_allele"],
+            "alternative_allele": alternative_allele,
+            "score_ref": cached["score_ref"],
+            "score_alt": cached["score_alt"],
+            "score_delta": cached["score_alt"] - cached["score_ref"],
+            "reduce_method": reduce_method,
+            "window_length": len(sequence),
+            "cache": {"hit": True, "saved_server_ms": cached.get("server_ms")},
+            "runtime": formatters.runtime(0, (time.monotonic() - t0) * 1000.0),
+        })
     try:
         mutated, pos = apply_snp(sequence, alternative_allele, position=position)
         client = _get_client()
@@ -203,6 +235,17 @@ async def score_snp(
     except (NimError, NimNotReadyError, NpzDecodeError, ScoringError) as exc:
         return _err(exc)
 
+    cache.put(
+        "score_snp",
+        cache.score_snp_key(sequence, alternative_allele, position, reduce_method),
+        {
+            "position": pos,
+            "reference_allele": sequence[pos],
+            "score_ref": score_ref,
+            "score_alt": score_alt,
+            "server_ms": ref_server_ms + alt_server_ms,
+        },
+    )
     return formatters.dump({
         "position": pos,
         "reference_allele": sequence[pos],
@@ -212,6 +255,7 @@ async def score_snp(
         "score_delta": score_alt - score_ref,
         "reduce_method": reduce_method,
         "window_length": len(sequence),
+        "cache": {"hit": False},
         "runtime": formatters.runtime(ref_server_ms + alt_server_ms, (time.monotonic() - t0) * 1000.0),
     })
 
@@ -259,17 +303,44 @@ async def score_variant_batch(
     client = _get_client()
     results: list[dict[str, Any]] = []
     server_ms_total = 0.0
+    n_cache_hits = 0
     for v in variants:
         try:
             seq = v["sequence"]
             alt = v["alternative_allele"]
-            pos = v.get("position")
-            mutated, position = apply_snp(seq, alt, position=pos)
+            pos_in = v.get("position")
+            key = cache.score_snp_key(seq, alt, pos_in, reduce_method)
+            cached = cache.get("score_snp", key)
+            if cached is not None:
+                n_cache_hits += 1
+                results.append({
+                    "id": v.get("id"),
+                    "position": cached["position"],
+                    "reference_allele": cached["reference_allele"],
+                    "alternative_allele": alt,
+                    "score_ref": cached["score_ref"],
+                    "score_alt": cached["score_alt"],
+                    "score_delta": cached["score_alt"] - cached["score_ref"],
+                    "from_cache": True,
+                })
+                continue
+            mutated, position = apply_snp(seq, alt, position=pos_in)
             ref_logits, r_ms = await _forward_logits(client, seq)
             alt_logits, a_ms = await _forward_logits(client, mutated)
             score_ref = log_likelihood_from_logits(ref_logits, seq, reduce_method=reduce_method)
             score_alt = log_likelihood_from_logits(alt_logits, mutated, reduce_method=reduce_method)
             server_ms_total += r_ms + a_ms
+            cache.put(
+                "score_snp",
+                key,
+                {
+                    "position": position,
+                    "reference_allele": seq[position],
+                    "score_ref": score_ref,
+                    "score_alt": score_alt,
+                    "server_ms": r_ms + a_ms,
+                },
+            )
             results.append(
                 {
                     "id": v.get("id"),
@@ -279,6 +350,7 @@ async def score_variant_batch(
                     "score_ref": score_ref,
                     "score_alt": score_alt,
                     "score_delta": score_alt - score_ref,
+                    "from_cache": False,
                 }
             )
         except (NimError, NimNotReadyError, NpzDecodeError, ScoringError, KeyError) as exc:
@@ -289,6 +361,7 @@ async def score_variant_batch(
         "n": len(results),
         "n_success": len(results) - n_failures,
         "n_failures": n_failures,
+        "n_cache_hits": n_cache_hits,
         "reduce_method": reduce_method,
         "results": results,
         "runtime": formatters.runtime(server_ms_total, (time.monotonic() - t0) * 1000.0),
@@ -340,6 +413,29 @@ async def score_splice_region(
     Returns markdown with reference / mutated scores, delta, and motif type.
     """
     t0 = time.monotonic()
+    cached = cache.get(
+        "score_splice_region",
+        cache.score_splice_region_key(
+            sequence,
+            splice_position,
+            reference_dinucleotide,
+            alternative_dinucleotide,
+            reduce_method,
+        ),
+    )
+    if cached is not None:
+        return formatters.dump({
+            "splice_position": splice_position,
+            "reference_dinucleotide": reference_dinucleotide,
+            "alternative_dinucleotide": alternative_dinucleotide,
+            "score_ref": cached["score_ref"],
+            "score_alt": cached["score_alt"],
+            "score_delta": cached["score_alt"] - cached["score_ref"],
+            "canonical": cached["canonical"],
+            "region_length": len(sequence),
+            "cache": {"hit": True, "saved_server_ms": cached.get("server_ms")},
+            "runtime": formatters.runtime(0, (time.monotonic() - t0) * 1000.0),
+        })
     try:
         if len(reference_dinucleotide) != 2 or len(alternative_dinucleotide) != 2:
             raise ScoringError(
@@ -371,6 +467,22 @@ async def score_splice_region(
     except (NimError, NimNotReadyError, NpzDecodeError, ScoringError) as exc:
         return _err(exc)
 
+    cache.put(
+        "score_splice_region",
+        cache.score_splice_region_key(
+            sequence,
+            splice_position,
+            reference_dinucleotide,
+            alternative_dinucleotide,
+            reduce_method,
+        ),
+        {
+            "score_ref": score_ref,
+            "score_alt": score_alt,
+            "canonical": canonical,
+            "server_ms": r_ms + a_ms,
+        },
+    )
     return formatters.dump({
         "splice_position": splice_position,
         "reference_dinucleotide": reference_dinucleotide,
@@ -380,6 +492,7 @@ async def score_splice_region(
         "score_delta": score_alt - score_ref,
         "canonical": canonical,
         "region_length": len(sequence),
+        "cache": {"hit": False},
         "runtime": formatters.runtime(r_ms + a_ms, (time.monotonic() - t0) * 1000.0),
     })
 
@@ -422,6 +535,18 @@ async def embed_sequence(sequence: str, layer_name: str | None = None) -> str:
     t0 = time.monotonic()
     checkpoint = _checkpoint_name()
     layer = layer_name or layer_catalog.default_embedding_layer(checkpoint)
+    cached = cache.get("embed_sequence", cache.embed_sequence_key(sequence, layer))
+    if cached is not None:
+        return formatters.dump({
+            "layer_name": layer,
+            "sequence_length": len(sequence),
+            "embedding_shape": cached["embedding_shape"],
+            "norm_mean": cached["norm_mean"],
+            "norm_std": cached["norm_std"],
+            "sample_values_first_column": cached.get("sample_values_first_column"),
+            "cache": {"hit": True, "saved_server_ms": cached.get("server_ms")},
+            "runtime": formatters.runtime(0, (time.monotonic() - t0) * 1000.0),
+        })
     try:
         client = _get_client()
         response = await client.forward({"sequence": sequence, "output_layers": [layer]})
@@ -444,13 +569,22 @@ async def embed_sequence(sequence: str, layer_name: str | None = None) -> str:
     except (NimError, NimNotReadyError, NpzDecodeError) as exc:
         return _err(exc)
 
-    return formatters.dump({
+    payload = {
         "layer_name": layer,
         "sequence_length": len(sequence),
         "embedding_shape": list(embedding.shape),
         "norm_mean": float(norms.mean()),
         "norm_std": float(norms.std()),
         "sample_values_first_column": [float(embedding[i, 0]) for i in range(min(5, embedding.shape[0]))],
+    }
+    cache.put(
+        "embed_sequence",
+        cache.embed_sequence_key(sequence, layer),
+        {**payload, "server_ms": float(response.get("elapsed_ms", 0.0))},
+    )
+    return formatters.dump({
+        **payload,
+        "cache": {"hit": False},
         "runtime": formatters.runtime(
             float(response.get("elapsed_ms", 0.0)),
             (time.monotonic() - t0) * 1000.0,
@@ -510,6 +644,20 @@ async def embed_similarity(
     checkpoint = _checkpoint_name()
     layer = layer_name or layer_catalog.default_embedding_layer(checkpoint)
 
+    cached = cache.get(
+        "embed_similarity", cache.embed_similarity_key(sequence_a, sequence_b, layer)
+    )
+    if cached is not None:
+        return formatters.dump({
+            "layer_name": layer,
+            "sequence_a_length": len(sequence_a),
+            "sequence_b_length": len(sequence_b),
+            "cosine_similarity_mean_pool": cached["cosine_similarity_mean_pool"],
+            "cosine_similarity_centered": cached["cosine_similarity_centered"],
+            "cache": {"hit": True, "saved_server_ms": cached.get("server_ms")},
+            "runtime": formatters.runtime(0, (time.monotonic() - t0) * 1000.0),
+        })
+
     async def _embed(seq: str) -> tuple[np.ndarray, float]:
         client = _get_client()
         resp = await client.forward({"sequence": seq, "output_layers": [layer]})
@@ -551,12 +699,22 @@ async def embed_similarity(
         )
         cos_pos = float(per_pos.mean())
 
+    cache.put(
+        "embed_similarity",
+        cache.embed_similarity_key(sequence_a, sequence_b, layer),
+        {
+            "cosine_similarity_mean_pool": cos_pool,
+            "cosine_similarity_centered": cos_pos,
+            "server_ms": ms_a + ms_b,
+        },
+    )
     return formatters.dump({
         "layer_name": layer,
         "sequence_a_length": len(sequence_a),
         "sequence_b_length": len(sequence_b),
         "cosine_similarity_mean_pool": cos_pool,
         "cosine_similarity_centered": cos_pos,
+        "cache": {"hit": False},
         "runtime": formatters.runtime(ms_a + ms_b, (time.monotonic() - t0) * 1000.0),
     })
 
@@ -692,6 +850,22 @@ async def list_layer_names() -> str:
 # ----------------------------------------------------------------------
 # Tool 9 — nim_health
 # ----------------------------------------------------------------------
+
+
+@mcp.tool()
+async def cache_stats() -> str:
+    """Return Evo2 result-cache size + per-namespace row counts.
+
+    Returns JSON. Shape:
+      {path, size_bytes, size_mb, cache_version, disabled,
+       namespaces: [{namespace, variant, rows}, ...]}
+
+    The cache deduplicates deterministic Evo2 results (score_sequence,
+    score_snp, score_splice_region, score_variant_at, embed_sequence,
+    embed_similarity) keyed by sequence/parameters + NIM_VARIANT. Disable
+    with EVO2_CACHE_DISABLED=1; override path with EVO2_CACHE_PATH.
+    """
+    return formatters.dump({**cache.stats(), "disabled": cache.disabled()})
 
 
 @mcp.tool()
@@ -862,6 +1036,20 @@ async def score_variant_at(
 
     if len(ref_base) != 1 or len(alt_base) != 1:
         return _err("ref_base and alt_base must each be exactly one nucleotide.")
+
+    cache_key = cache.score_variant_at_key(
+        chromosome, position, ref_base, alt_base, window_size, species, assembly, reduce_method
+    )
+    cached = cache.get("score_variant_at", cache_key)
+    if cached is not None:
+        return formatters.dump({
+            "variant": cached["variant"],
+            "context": cached["context"],
+            "scores": cached["scores"],
+            "strand_swap_note": cached.get("strand_swap_note"),
+            "cache": {"hit": True, "saved_server_ms": cached.get("server_ms")},
+            "runtime": formatters.runtime(0, (time.monotonic() - t0) * 1000.0),
+        })
     if ref_base.upper() not in {"A", "C", "G", "T", "N"}:
         return _err(f"Invalid ref_base {ref_base!r}. Use A/C/G/T/N.")
     if alt_base.upper() not in {"A", "C", "G", "T", "N"}:
@@ -941,7 +1129,7 @@ async def score_variant_at(
     except (NimError, NimNotReadyError, NpzDecodeError, ScoringError) as exc:
         return _err(exc, stage="nim_scoring")
 
-    return formatters.dump({
+    result = {
         "variant": {
             "chromosome": ctx.chromosome,
             "position": ctx.start + ctx.center_index,
@@ -962,5 +1150,10 @@ async def score_variant_at(
             "reduce_method": reduce_method,
         },
         "strand_swap_note": strand_swap_note,
+    }
+    cache.put("score_variant_at", cache_key, {**result, "server_ms": r_ms + a_ms})
+    return formatters.dump({
+        **result,
+        "cache": {"hit": False},
         "runtime": formatters.runtime(r_ms + a_ms, (time.monotonic() - t0) * 1000.0),
     })

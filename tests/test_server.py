@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, patch
 import numpy as np
 import pytest
 
-from evo2_nim_mcp import layer_catalog, server
+from evo2_nim_mcp import cache, layer_catalog, server
 from tests.conftest import npz_to_b64
 
 
@@ -30,11 +30,15 @@ def mock_client():
 
 
 @pytest.fixture(autouse=True)
-def reset_global_client():
-    """Each test starts with no cached client."""
+def reset_global_client(tmp_path, monkeypatch):
+    """Each test starts with no cached client AND a fresh empty result cache."""
+    monkeypatch.setenv("EVO2_CACHE_PATH", str(tmp_path / "cache.sqlite"))
+    monkeypatch.delenv("EVO2_CACHE_DISABLED", raising=False)
+    cache.reset_for_tests()
     server._client = None
     yield
     server._client = None
+    cache.reset_for_tests()
 
 
 def _logits_favoring(sequence: str, vocab_size: int = 512) -> np.ndarray:
@@ -101,6 +105,54 @@ class TestScoreSequence:
         assert "error" in d
         msg = d["error"]["message"].lower()
         assert "lm_head" in msg or "wrong_layer" in msg
+
+
+class TestScoreSequenceCache:
+    """End-to-end: same sequence twice → second call hits cache, no NIM call."""
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_skips_nim(self, mock_client):
+        seq = "ACGTACGTACGT"
+        mock_client.forward.return_value = _forward_response(
+            layer_catalog.LM_HEAD_LAYER, _logits_favoring(seq)
+        )
+        with patch.object(server, "_get_client", return_value=mock_client):
+            out1 = await server.score_sequence(seq)
+            out2 = await server.score_sequence(seq)
+        d1, d2 = json.loads(out1), json.loads(out2)
+        # Second call must NOT have made a forward request (one ref call only).
+        assert mock_client.forward.call_count == 1
+        # Same score.
+        assert d1["score"] == d2["score"]
+        # First call shows cache miss, second shows hit.
+        assert d1["cache"]["hit"] is False
+        assert d2["cache"]["hit"] is True
+        assert d2["runtime"]["server_ms"] == 0
+
+    @pytest.mark.asyncio
+    async def test_different_reduce_method_is_different_key(self, mock_client):
+        seq = "ACGTACGT"
+        mock_client.forward.return_value = _forward_response(
+            layer_catalog.LM_HEAD_LAYER, _logits_favoring(seq)
+        )
+        with patch.object(server, "_get_client", return_value=mock_client):
+            await server.score_sequence(seq, reduce_method="mean")
+            await server.score_sequence(seq, reduce_method="sum")
+        # Two different keys → two NIM calls.
+        assert mock_client.forward.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_disabled_skips_cache(self, mock_client, monkeypatch):
+        monkeypatch.setenv("EVO2_CACHE_DISABLED", "1")
+        seq = "ACGTACGT"
+        mock_client.forward.return_value = _forward_response(
+            layer_catalog.LM_HEAD_LAYER, _logits_favoring(seq)
+        )
+        with patch.object(server, "_get_client", return_value=mock_client):
+            await server.score_sequence(seq)
+            await server.score_sequence(seq)
+        # Both calls hit NIM when cache is disabled.
+        assert mock_client.forward.call_count == 2
 
 
 class TestScoreSnp:
