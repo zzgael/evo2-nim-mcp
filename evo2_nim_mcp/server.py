@@ -27,7 +27,31 @@ from evo2_nim_mcp.scoring import (
     ScoringError,
     apply_snp,
     log_likelihood_from_logits,
+    per_position_log_likelihoods,
 )
+
+import base64
+import io
+
+
+def _encode_npz(**arrays: np.ndarray) -> str:
+    """Pack named arrays into a base64 NPZ blob for inline transport.
+
+    The LLM decodes in code-interp with:
+        import base64, io, numpy as np
+        a = np.load(io.BytesIO(base64.b64decode(payload)))
+
+    Compressed; suitable for 80 KB - 50 MB payloads. Beyond that the inline
+    cost dominates the LLM context and the caller should chunk.
+    """
+    buf = io.BytesIO()
+    np.savez_compressed(buf, **arrays)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+# Hard cap: payload over this size after base64 is refused at the source — the
+# LLM context window can't hold it cleanly and the savings vs. chunking are nil.
+_MAX_INLINE_NPZ_BYTES = 60 * 1024 * 1024  # 60 MB base64 (≈45 MB raw, well within 200K-token windows)
 
 mcp = FastMCP("Evo2 NIM")
 
@@ -108,13 +132,18 @@ async def _forward_logits(client: NimClient, sequence: str) -> tuple[np.ndarray,
 
 
 @mcp.tool()
-async def score_sequence(sequence: str, reduce_method: str = "mean") -> str:
+async def score_sequence(
+    sequence: str,
+    reduce_method: str = "mean",
+    return_per_position: bool = False,
+) -> str:
     """Compute the log-likelihood of a DNA sequence under Evo2.
 
     USE THIS WHEN:
     - User wants to rank candidate sequences by biological plausibility
     - User wants a single scalar score for a whole sequence
-    - User is screening designed/synthetic sequences for naturalness
+    - User wants per-base log-likelihood for plotting / windowed analysis
+      (set `return_per_position=True`)
 
     DO NOT USE WHEN:
     - User has a specific point mutation → prefer `score_snp` (gives a delta)
@@ -124,25 +153,41 @@ async def score_sequence(sequence: str, reduce_method: str = "mean") -> str:
     PARAMETERS:
     - `sequence`: DNA, length ≥ 2, IUPAC alphabet (A, C, G, T, N — upper or lowercase).
     - `reduce_method`: "mean" (default; robust to length) or "sum" (totals all positions).
+    - `return_per_position`: when True, also return the per-position log-likelihood
+      array as inline base64 NPZ for code-interp analysis. ~5 bytes per position
+      on the wire (NPZ-compressed float32), so a 20 kb sequence is ~100 KB base64.
 
     INTERPRETATION:
     - Higher (less negative) score = more plausible under the model.
-    - The score is a per-position log-likelihood (with `reduce_method="mean"`).
-      A score near `log(1/4) ≈ -1.39` corresponds to roughly random nucleotides;
-      natural genomic DNA typically scores higher (less negative).
+    - A score near `log(1/4) ≈ -1.39` ≈ random nucleotides; natural DNA scores higher.
 
-    Returns a markdown report with the score, sequence preview, and runtime.
+    OUTPUT: JSON. Without `return_per_position`:
+      {sequence_length, score, reduce_method, cache, runtime}
+
+    With `return_per_position=True`, the response also includes a `per_position`
+    object with `npz_payload` and a decode snippet:
+      import base64, io, numpy as np
+      a = np.load(io.BytesIO(base64.b64decode(payload)))
+      ll = a["ll"]   # shape (seq_len - 1,), float32, log-prob of token i+1 given 1..i
     """
     t0 = time.monotonic()
-    cached = cache.get("score_sequence", cache.score_sequence_key(sequence, reduce_method))
-    if cached is not None:
-        return formatters.dump({
-            "sequence_length": len(sequence),
-            "score": cached["score"],
-            "reduce_method": reduce_method,
-            "cache": {"hit": True, "saved_server_ms": cached.get("server_ms")},
-            "runtime": formatters.runtime(0, (time.monotonic() - t0) * 1000.0),
-        })
+    cache_key = cache.score_sequence_key(sequence, reduce_method)
+
+    # Fast path: scalar cache only. If the caller asks for per-position data
+    # AND we have a scalar-only cached entry, we still have to call NIM to get
+    # the array. (Could split cache namespaces to also memoise the array, but
+    # that ~doubles cache size on every score; skip for now.)
+    if not return_per_position:
+        cached = cache.get("score_sequence", cache_key)
+        if cached is not None:
+            return formatters.dump({
+                "sequence_length": len(sequence),
+                "score": cached["score"],
+                "reduce_method": reduce_method,
+                "cache": {"hit": True, "saved_server_ms": cached.get("server_ms")},
+                "runtime": formatters.runtime(0, (time.monotonic() - t0) * 1000.0),
+            })
+
     try:
         logits, server_ms = await _forward_logits(_get_client(), sequence)
         score = log_likelihood_from_logits(logits, sequence, reduce_method=reduce_method)
@@ -151,16 +196,34 @@ async def score_sequence(sequence: str, reduce_method: str = "mean") -> str:
 
     cache.put(
         "score_sequence",
-        cache.score_sequence_key(sequence, reduce_method),
+        cache_key,
         {"score": score, "server_ms": server_ms},
     )
-    return formatters.dump({
+
+    payload: dict = {
         "sequence_length": len(sequence),
         "score": score,
         "reduce_method": reduce_method,
         "cache": {"hit": False},
         "runtime": formatters.runtime(server_ms, (time.monotonic() - t0) * 1000.0),
-    })
+    }
+    if return_per_position:
+        try:
+            ll_arr = per_position_log_likelihoods(logits, sequence)
+        except ScoringError as exc:
+            return _err(exc)
+        npz = _encode_npz(ll=ll_arr)
+        payload["per_position"] = {
+            "shape": list(ll_arr.shape),
+            "dtype": "float32",
+            "npz_payload": npz,
+            "decode": (
+                "import base64, io, numpy as np; "
+                "a = np.load(io.BytesIO(base64.b64decode(payload))); "
+                "ll = a['ll']  # shape (seq_len - 1,)"
+            ),
+        }
+    return formatters.dump(payload)
 
 
 # ----------------------------------------------------------------------
@@ -502,51 +565,90 @@ async def score_splice_region(
 # ----------------------------------------------------------------------
 
 
+# Embed-tensor inline limits. `full` mode emits the entire (seq_len, hidden)
+# tensor as base64 NPZ; payload ≈ seq_len × hidden × 2 bytes (float16) ×
+# ~1.3x base64 overhead. 2 kb at 8192-d float16 ≈ 44 MB base64 → just under
+# the 60 MB ceiling. Beyond that, chunking is the right move.
+_EMBED_FULL_MAX_SEQ_LEN = 2000
+
+
 @mcp.tool()
-async def embed_sequence(sequence: str, layer_name: str | None = None) -> str:
+async def embed_sequence(
+    sequence: str,
+    layer_name: str | None = None,
+    return_mode: str = "stats",
+) -> str:
     """Extract embeddings for a DNA sequence at a named hidden layer.
 
     USE THIS WHEN:
     - User wants vector representations for similarity search, clustering,
-      or downstream classification
-    - User is building a feature matrix from many sequences
+      or downstream classification.
+    - User wants the raw tensor for code-interp analysis (set
+      `return_mode='pooled'` for a single 8192-d vector per sequence, or
+      `return_mode='full'` for the full (seq_len, hidden) tensor).
 
     DO NOT USE WHEN:
-    - User wants a single scalar score → use `score_sequence`
-    - User does not specify a layer and you don't know which one is appropriate
-      → call `list_layer_names` first
+    - User wants a single scalar likelihood score → use `score_sequence`
+    - User wants pairwise similarity only → use `embed_similarity`
 
     PARAMETERS:
-    - `sequence`: DNA, IUPAC alphabet, length ≥ 1
-    - `layer_name`: name of an `output_layers` entry to extract.
-      If None, a sensible default for the loaded checkpoint is used
-      (intermediate block; see `list_layer_names`).
+    - `sequence`: DNA, IUPAC alphabet, length ≥ 1.
+    - `layer_name`: which hidden layer to extract. None = checkpoint default
+      (e.g. `decoder.layers.20.mlp` for the 40b).
+    - `return_mode`:
+        - `"stats"` (default): shape + L2-norm summary only. Cheap; for
+          smell-test / "is this OOD?".
+        - `"pooled"`: also include the mean-pooled 8192-d vector as inline
+          base64 NPZ. ~32 KB on the wire. Use this for cross-sequence
+          similarity / clustering.
+        - `"full"`: also include the full (seq_len, hidden_dim) float16
+          tensor as inline base64 NPZ. Refused above seq_len = 2000
+          (payload would exceed 60 MB context budget). Use for per-position
+          analysis or chunk the sequence yourself.
 
-    INTERPRETATION:
-    - The output reports the embedding's shape and the L2 norm distribution
-      (mean ± std across positions). Wildly different norms across sequences
-      may indicate unusual or out-of-distribution input.
-    - The full embedding tensor is NOT returned in markdown for size reasons —
-      only summary statistics. Callers needing the raw tensor should call the
-      NIM `/forward` endpoint directly.
+    OUTPUT: JSON. With `return_mode='stats'`:
+      {layer_name, sequence_length, embedding_shape, norm_mean, norm_std,
+       sample_values_first_column, cache, runtime}
 
-    Returns markdown summary.
+    With `return_mode='pooled'`, the response also includes:
+      {"pooled": {"shape": [hidden_dim], "dtype": "float32",
+                  "npz_payload": "...", "decode": "..."}}
+
+    With `return_mode='full'`, the response also includes:
+      {"full": {"shape": [seq_len, hidden_dim], "dtype": "float16",
+                "npz_payload": "...", "decode": "..."}}
     """
+    if return_mode not in {"stats", "pooled", "full"}:
+        return _err(f"return_mode must be 'stats' | 'pooled' | 'full' (got {return_mode!r}).")
+    if return_mode == "full" and len(sequence) > _EMBED_FULL_MAX_SEQ_LEN:
+        return _err(
+            f"return_mode='full' refused: sequence length {len(sequence)} exceeds the "
+            f"{_EMBED_FULL_MAX_SEQ_LEN}-position inline cap. Chunk the sequence and "
+            "embed each chunk separately, or use return_mode='pooled' for a single vector."
+        )
+
     t0 = time.monotonic()
     checkpoint = _checkpoint_name()
     layer = layer_name or layer_catalog.default_embedding_layer(checkpoint)
-    cached = cache.get("embed_sequence", cache.embed_sequence_key(sequence, layer))
-    if cached is not None:
-        return formatters.dump({
-            "layer_name": layer,
-            "sequence_length": len(sequence),
-            "embedding_shape": cached["embedding_shape"],
-            "norm_mean": cached["norm_mean"],
-            "norm_std": cached["norm_std"],
-            "sample_values_first_column": cached.get("sample_values_first_column"),
-            "cache": {"hit": True, "saved_server_ms": cached.get("server_ms")},
-            "runtime": formatters.runtime(0, (time.monotonic() - t0) * 1000.0),
-        })
+    cache_key = cache.embed_sequence_key(sequence, layer)
+
+    # Stats-only fast path: scalar-cached entries cover this. The 'pooled' and
+    # 'full' modes need the actual tensor, which the cache doesn't store, so we
+    # bypass the cache for those.
+    if return_mode == "stats":
+        cached = cache.get("embed_sequence", cache_key)
+        if cached is not None:
+            return formatters.dump({
+                "layer_name": layer,
+                "sequence_length": len(sequence),
+                "embedding_shape": cached["embedding_shape"],
+                "norm_mean": cached["norm_mean"],
+                "norm_std": cached["norm_std"],
+                "sample_values_first_column": cached.get("sample_values_first_column"),
+                "cache": {"hit": True, "saved_server_ms": cached.get("server_ms")},
+                "runtime": formatters.runtime(0, (time.monotonic() - t0) * 1000.0),
+            })
+
     try:
         client = _get_client()
         response = await client.forward({"sequence": sequence, "output_layers": [layer]})
@@ -563,9 +665,6 @@ async def embed_sequence(sequence: str, layer_name: str | None = None) -> str:
         if embedding.ndim == 3 and embedding.shape[1] == 1:
             embedding = embedding.squeeze(axis=1)
         norms = np.linalg.norm(embedding.astype(np.float64), axis=-1)
-        summary_rows = ", ".join(
-            f"{float(embedding[i, 0]):+.3f}" for i in range(min(5, embedding.shape[0]))
-        )
     except (NimError, NimNotReadyError, NpzDecodeError) as exc:
         return _err(exc)
 
@@ -575,21 +674,51 @@ async def embed_sequence(sequence: str, layer_name: str | None = None) -> str:
         "embedding_shape": list(embedding.shape),
         "norm_mean": float(norms.mean()),
         "norm_std": float(norms.std()),
-        "sample_values_first_column": [float(embedding[i, 0]) for i in range(min(5, embedding.shape[0]))],
+        "sample_values_first_column": [
+            float(embedding[i, 0]) for i in range(min(5, embedding.shape[0]))
+        ],
     }
     cache.put(
         "embed_sequence",
-        cache.embed_sequence_key(sequence, layer),
+        cache_key,
         {**payload, "server_ms": float(response.get("elapsed_ms", 0.0))},
     )
-    return formatters.dump({
+
+    out: dict = {
         **payload,
         "cache": {"hit": False},
         "runtime": formatters.runtime(
             float(response.get("elapsed_ms", 0.0)),
             (time.monotonic() - t0) * 1000.0,
         ),
-    })
+    }
+
+    if return_mode == "pooled":
+        pooled = embedding.astype(np.float32).mean(axis=0)
+        out["pooled"] = {
+            "shape": list(pooled.shape),
+            "dtype": "float32",
+            "npz_payload": _encode_npz(pooled=pooled),
+            "decode": (
+                "import base64, io, numpy as np; "
+                "a = np.load(io.BytesIO(base64.b64decode(payload))); "
+                "v = a['pooled']  # shape (hidden_dim,), float32"
+            ),
+        }
+    elif return_mode == "full":
+        # float16 halves payload vs float32 with negligible info loss for embeddings
+        emb_fp16 = embedding.astype(np.float16)
+        out["full"] = {
+            "shape": list(emb_fp16.shape),
+            "dtype": "float16",
+            "npz_payload": _encode_npz(embedding=emb_fp16),
+            "decode": (
+                "import base64, io, numpy as np; "
+                "a = np.load(io.BytesIO(base64.b64decode(payload))); "
+                "emb = a['embedding']  # shape (seq_len, hidden_dim), float16"
+            ),
+        }
+    return formatters.dump(out)
 
 
 # ----------------------------------------------------------------------

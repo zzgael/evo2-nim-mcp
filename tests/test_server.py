@@ -10,6 +10,8 @@ fields the LLM relies on.
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -105,6 +107,103 @@ class TestScoreSequence:
         assert "error" in d
         msg = d["error"]["message"].lower()
         assert "lm_head" in msg or "wrong_layer" in msg
+
+
+class TestScoreSequencePerPosition:
+    """`return_per_position=True` returns the per-base log-likelihood vector
+    as inline base64 NPZ, suitable for code-interp analysis."""
+
+    @pytest.mark.asyncio
+    async def test_returns_per_position_array(self, mock_client):
+        seq = "ACGTACGTACGT"
+        mock_client.forward.return_value = _forward_response(
+            layer_catalog.LM_HEAD_LAYER, _logits_favoring(seq)
+        )
+        with patch.object(server, "_get_client", return_value=mock_client):
+            out = await server.score_sequence(seq, return_per_position=True)
+        d = _parse(out)
+        assert "per_position" in d
+        pp = d["per_position"]
+        assert pp["shape"] == [len(seq) - 1]
+        assert pp["dtype"] == "float32"
+        # Decode the inline payload and verify it round-trips
+        payload = pp["npz_payload"]
+        arrs = np.load(io.BytesIO(base64.b64decode(payload)))
+        ll = arrs["ll"]
+        assert ll.shape == (len(seq) - 1,)
+        # Mean of per-position == aggregated score within float tolerance
+        assert abs(float(ll.mean()) - d["score"]) < 1e-5
+
+    @pytest.mark.asyncio
+    async def test_default_omits_per_position(self, mock_client):
+        seq = "ACGTACGT"
+        mock_client.forward.return_value = _forward_response(
+            layer_catalog.LM_HEAD_LAYER, _logits_favoring(seq)
+        )
+        with patch.object(server, "_get_client", return_value=mock_client):
+            out = await server.score_sequence(seq)
+        d = _parse(out)
+        assert "per_position" not in d
+
+
+class TestEmbedSequenceReturnModes:
+    """`return_mode` controls whether the raw tensor / pooled vector ship inline."""
+
+    @pytest.mark.asyncio
+    async def test_pooled_returns_8192_vector(self, mock_client):
+        seq = "ACGTACGT"
+        embedding = np.random.default_rng(1).standard_normal((8, 8192)).astype(np.float32)
+        default_layer = layer_catalog.default_embedding_layer("evo2_40b")
+        mock_client.forward.return_value = _forward_response(default_layer, embedding)
+        with patch.object(server, "_get_client", return_value=mock_client):
+            out = await server.embed_sequence(seq, return_mode="pooled")
+        d = _parse(out)
+        assert "pooled" in d
+        assert d["pooled"]["shape"] == [8192]
+        arrs = np.load(io.BytesIO(base64.b64decode(d["pooled"]["npz_payload"])))
+        pooled = arrs["pooled"]
+        assert pooled.shape == (8192,)
+        # Pooled vector == position-mean of the embedding (within fp tolerance)
+        assert np.allclose(pooled, embedding.mean(axis=0), rtol=1e-4)
+
+    @pytest.mark.asyncio
+    async def test_full_returns_tensor(self, mock_client):
+        seq = "ACGTACGT"
+        embedding = np.random.default_rng(2).standard_normal((8, 8192)).astype(np.float32)
+        default_layer = layer_catalog.default_embedding_layer("evo2_40b")
+        mock_client.forward.return_value = _forward_response(default_layer, embedding)
+        with patch.object(server, "_get_client", return_value=mock_client):
+            out = await server.embed_sequence(seq, return_mode="full")
+        d = _parse(out)
+        assert "full" in d
+        assert d["full"]["shape"] == [8, 8192]
+        assert d["full"]["dtype"] == "float16"
+        arrs = np.load(io.BytesIO(base64.b64decode(d["full"]["npz_payload"])))
+        tensor = arrs["embedding"]
+        assert tensor.shape == (8, 8192)
+        # fp16 vs fp32 — tolerate the lossy cast
+        assert np.allclose(tensor.astype(np.float32), embedding, atol=1e-2)
+
+    @pytest.mark.asyncio
+    async def test_full_refused_above_2000_positions(self, mock_client):
+        # We can craft a long fake seq without hitting NIM since the size check
+        # runs before any forward call.
+        seq = "A" * 2500
+        with patch.object(server, "_get_client", return_value=mock_client):
+            out = await server.embed_sequence(seq, return_mode="full")
+        d = _parse(out)
+        assert "error" in d
+        assert "2000" in d["error"]["message"]
+        # Most importantly: NIM was never called.
+        assert mock_client.forward.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_invalid_return_mode_rejected(self, mock_client):
+        with patch.object(server, "_get_client", return_value=mock_client):
+            out = await server.embed_sequence("ACGT", return_mode="bogus")
+        d = _parse(out)
+        assert "error" in d
+        assert "stats" in d["error"]["message"]
 
 
 class TestScoreSequenceCache:

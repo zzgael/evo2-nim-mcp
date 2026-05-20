@@ -125,6 +125,44 @@ def log_likelihood_from_logits(
     return float(target_log_probs.mean())
 
 
+def per_position_log_likelihoods(
+    logits: np.ndarray,
+    sequence: str,
+) -> np.ndarray:
+    """Return the per-position log-likelihood vector under autoregressive scoring.
+
+    Output shape: `(seq_len - 1,)`, dtype `float32`. Element i is the
+    log-probability of token i+1 under the model's distribution at position i
+    (next-token prediction). Aggregating with `.mean()` or `.sum()` gives
+    the same scalar as `log_likelihood_from_logits(...)` with the matching
+    `reduce_method`.
+
+    Useful for per-base analysis: locating bases the model finds unlikely
+    under the reference, plotting likelihood profiles, ref-vs-alt
+    position-wise comparison.
+
+    Raises the same `ScoringError` cases as `log_likelihood_from_logits`.
+    """
+    token_ids = np.frombuffer(sequence.encode("ascii"), dtype=np.uint8).astype(np.int64)
+    seq_len = token_ids.shape[0]
+
+    if logits.ndim != 2:
+        raise ScoringError(
+            f"logits must be 2D (seq_len, vocab_size); got shape {logits.shape}."
+        )
+    if logits.shape[0] != seq_len:
+        raise ScoringError(
+            f"logits seq dim ({logits.shape[0]}) does not match sequence length ({seq_len})."
+        )
+    if seq_len < 2:
+        raise ScoringError(
+            "Need at least 2 tokens to compute autoregressive log-likelihood."
+        )
+
+    log_probs_all = log_softmax(logits, axis=-1)
+    return log_probs_all[np.arange(seq_len - 1), token_ids[1:]].astype(np.float32)
+
+
 def apply_snp(sequence: str, alternative_allele: str, position: int | None = None) -> tuple[str, int]:
     """Return (mutated_sequence, position) where the base at `position` is replaced by `alternative_allele`.
 
